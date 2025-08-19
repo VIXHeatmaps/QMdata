@@ -4,7 +4,6 @@
   <meta charset="utf-8">
   <title>QuantMage → Excel Exporter</title>
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <!-- ExcelJS for XLSX generation -->
   <script src="https://cdn.jsdelivr.net/npm/exceljs@4.4.0/dist/exceljs.min.js"></script>
   <style>
     body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; margin: 24px; }
@@ -19,9 +18,9 @@
 <body>
   <h1>QuantMage → Excel Exporter</h1>
   <p class="muted">
-    Choose a saved QuantMage HTML (either $ or % view). This creates a formatted <b>.xlsx</b> with:
-    <b>Metrics</b> (Gain, CAGR, MD, WinRate, Volatility, Cumulative Return in %), and <b>Correlations</b>.
-    Columns that are empty for all rows are automatically omitted. Everything runs locally.
+    Choose a saved QuantMage HTML (either $ or % view). This creates a formatted <b>.xlsx</b> with
+    a <b>Metrics</b> sheet (Gain, CAGR, MD, WinRate, Volatility, Cumulative Return in %)
+    and a <b>Correlations</b> sheet. Columns empty for every row are omitted. Everything runs locally.
   </p>
   <div class="box">
     <div class="row">
@@ -32,7 +31,7 @@
   </div>
 
 <script>
-/* ---------- Helpers to read embedded JSON ---------- */
+/* ---------- helpers ---------- */
 const RE_CONST = name => new RegExp(`const\\s+${name}\\s*=\\s*(".*?");`, 's');
 function parseDoubleJSON(jsStringLiteral){ const inner = JSON.parse(jsStringLiteral); return JSON.parse(inner); }
 function ymdToDate(i){ const s=String(i); return new Date(+s.slice(0,4), +s.slice(4,6)-1, +s.slice(6,8)); }
@@ -48,22 +47,25 @@ function maxDrawdown(values){ let peak=values[0], mdd=0; const dd=[]; for(const 
 function ulcerIndex(dd){ if(!dd.length) return NaN; const ms=dd.reduce((s,x)=>s+x*x,0)/dd.length; return Math.sqrt(ms); }
 function toDateISO(d){ const z=n=>String(n).padStart(2,'0'); return `${d.getFullYear()}-${z(d.getMonth()+1)}-${z(d.getDate())}`; }
 
-/* ---------- Pearson correlation on overlapping dates ---------- */
+/* correlation with overlap, return null for non-finite */
 function corrForMaps(mapA, mapB){
-  const keysA = Object.keys(mapA), keysB = Object.keys(mapB);
-  const small = keysA.length < keysB.length ? keysA : keysB;
+  const keys = Object.keys(mapA).length < Object.keys(mapB).length ? Object.keys(mapA) : Object.keys(mapB);
   let xs=[], ys=[];
-  for(const k of small){ if(mapB[k]!==undefined && mapA[k]!==undefined){ xs.push(mapA[k]); ys.push(mapB[k]); } }
-  if(xs.length < 2) return NaN;
-  const n=xs.length, mean = a => a.reduce((p,c)=>p+c,0)/a.length;
+  for(const k of keys){ if(mapA[k]!==undefined && mapB[k]!==undefined){ xs.push(mapA[k]); ys.push(mapB[k]); } }
+  if(xs.length < 2) return null;
+  const mean = a => a.reduce((p,c)=>p+c,0)/a.length;
   const mx=mean(xs), my=mean(ys);
   let num=0, denx=0, deny=0;
-  for(let i=0;i<n;i++){ const dx=xs[i]-mx, dy=ys[i]-my; num+=dx*dy; denx+=dx*dx; deny+=dy*dy; }
+  for(let i=0;i<xs.length;i++){ const dx=xs[i]-mx, dy=ys[i]-my; num+=dx*dy; denx+=dx*dx; deny+=dy*dy; }
   const den = Math.sqrt(denx*deny);
-  return den>0 ? num/den : NaN;
+  if(den<=0) return null;
+  let r = num/den;
+  if(!isFinite(r)) return null;
+  if(r>1) r=1; if(r<-1) r=-1;   // clamp tiny FP errors
+  return r;
 }
 
-/* ---------- Main ---------- */
+/* ---------- main ---------- */
 async function run(){
   const file = document.getElementById('htmlFile').files[0];
   if(!file){ alert('Pick a saved HTML file first'); return; }
@@ -83,152 +85,4 @@ async function run(){
 
   for (const [sid, payload] of Object.entries(trading_spells)){
     const td = payload.trading_data || {};
-    const vals = Array.isArray(td.value_history) ? td.value_history : [];
-    if (vals.length < 3) continue;
-    const dts = inferDates(vals, dates_list, td.last_value_date);
-    const x = vals.map(Number).filter(v=>v>0); if (x.length < 3) continue;
-
-    // Metrics
-    const rets = pctReturns(x);
-    const days = Math.max((dts[dts.length-1]-dts[0])/(1000*60*60*24), 1);
-    const years = days/365.25;
-    const growth = x[x.length-1]/x[0];
-    const cagr = years>0 ? (growth**(1/years)-1) : NaN;
-    const {mdd, dd} = maxDrawdown(x);
-    const ui = ulcerIndex(dd);
-    const upi = (ui>0) ? (cagr/ui) : NaN;
-    const vol_d = stdev(rets), vol_a = vol_d*Math.sqrt(252);
-    const mean_d = rets.reduce((a,b)=>a+b,0)/rets.length;
-    const sharpe = vol_d>0 ? (mean_d/vol_d)*Math.sqrt(252) : NaN;
-    const downs = rets.filter(r=>r<0);
-    const sortino = downs.length ? (mean_d/stdev(downs))*Math.sqrt(252) : Infinity;
-    const winrate = rets.filter(r=>r>0).length/rets.length;
-    const gains = rets.filter(r=>r>0).reduce((a,b)=>a+b,0);
-    const losses = rets.filter(r=>r<0).reduce((a,b)=>a+b,0);
-    const gpr = losses<0 ? (gains/Math.abs(losses)) : Infinity;
-    const mar = mdd<0 ? (cagr/Math.abs(mdd)) : Infinity;
-    const cumret = growth - 1;
-    const since = toDateISO(dts[0]);
-
-    const name = (payload.name || "").trim();
-    names.push(name);
-
-    rowsRaw.push({
-      Name: name,
-      URL: base+sid,
-      CurrentValue: x[x.length-1],
-      Gain: cumret,                 // % format (AllTimePct renamed)
-      Since: since,
-      CAGR: cagr,                   // % format
-      MD: (mdd==null? null : Math.abs(mdd)), // % format
-      Sharpe: isFinite(sharpe)?sharpe:null,
-      Sortino: isFinite(sortino)?sortino:null,
-      MAR: isFinite(mar)?mar:null,
-      UPI: isFinite(upi)?upi:null,
-      GPR: isFinite(gpr)?gpr:null,
-      WinRate: winrate,             // % format
-      Volatility: vol_a,            // % format
-      CumulativeReturn: cumret      // % format
-    });
-
-    // Daily returns for correlation
-    const m = {};
-    for(let i=1;i<x.length;i++){
-      const dateISO = toDateISO(dts[i]);
-      if (x[i-1]>0) m[dateISO] = x[i]/x[i-1]-1;
-    }
-    returnsMaps[name] = m;
-  }
-
-  // Drop columns empty across all rows (keep Name & URL)
-  const allCols = Object.keys(rowsRaw[0] || {});
-  const headers = allCols.filter(c => {
-    if (c==="Name"||c==="URL") return true;
-    return rowsRaw.some(r => r[c] !== "" && r[c] !== null && r[c] !== undefined && !(typeof r[c]==="number" && isNaN(r[c])));
-  });
-
-  // ---- Build XLSX with ExcelJS ----
-  const wb = new ExcelJS.Workbook();
-
-  // Metrics sheet
-  const ws1 = wb.addWorksheet('Metrics', {views:[{state:'frozen', ySplit:1}]});
-  const headerRow = ws1.addRow(headers);
-  headerRow.font = { bold: true };
-  const dataRows = rowsRaw.map(r => headers.map(h => r[h]));
-  dataRows.forEach(r => ws1.addRow(r));
-
-  ws1.addTable({
-    name: 'MetricsTable',
-    ref: 'A1',
-    headerRow: true,
-    columns: headers.map(h => ({name: h})),
-    rows: dataRows,
-    style: { theme: 'TableStyleMedium9', showRowStripes: true }
-  });
-
-  headers.forEach((h, i) => {
-    const col = ws1.getColumn(i+1);
-    if (h==='Name') col.width = 48;
-    else if (h==='URL') col.width = 42;
-    else if (h==='Since') col.width = 12;
-    else col.width = 14;
-  });
-
-  // Number formats
-  const pctCols = ['Gain','CAGR','MD','WinRate','Volatility','CumulativeReturn'];
-  const twoDecCols = ['Sharpe','Sortino','MAR','UPI','GPR','CurrentValue'];
-  const colIndex = Object.fromEntries(headers.map((h,i)=>[h,i+1]));
-  for (let r=2; r<=ws1.rowCount; r++){
-    pctCols.forEach(h => { if(colIndex[h]) ws1.getCell(r, colIndex[h]).numFmt = '0.00%'; });
-    twoDecCols.forEach(h => { if(colIndex[h]) ws1.getCell(r, colIndex[h]).numFmt = '0.00'; });
-    if (colIndex['Since']) ws1.getCell(r, colIndex['Since']).numFmt = 'yyyy-mm-dd';
-  }
-
-  // Correlations sheet
-  const ws2 = wb.addWorksheet('Correlations', {views:[{state:'frozen', xSplit:1, ySplit:1}]});
-  const header2 = ['Name', ...names];
-  ws2.addRow(header2).font = { bold: true };
-  const corrRows = [];
-  for(let i=0;i<names.length;i++){
-    const row = [names[i]];
-    for(let j=0;j<names.length;j++){
-      const val = (i===j) ? 1 : corrForMaps(returnsMaps[names[i]], returnsMaps[names[j]]);
-      row.push(val);
-    }
-    corrRows.push(row);
-    ws2.addRow(row);
-  }
-  ws2.addTable({
-    name: 'CorrTable',
-    ref: 'A1',
-    headerRow: true,
-    columns: header2.map(h => ({name: h})),
-    rows: corrRows,
-    style: { theme: 'TableStyleMedium2', showRowStripes: true, showColumnStripes: true }
-  });
-  ws2.getColumn(1).width = 48;
-  for(let c=2; c<=ws2.columnCount; c++){
-    ws2.getColumn(c).width = 7;
-    for(let r=2; r<=ws2.rowCount; r++){
-      ws2.getCell(r,c).numFmt = '0.00';
-    }
-  }
-
-  // Download
-  const buf = await wb.xlsx.writeBuffer();
-  const blob = new Blob([buf], {type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'});
-  const a = document.createElement('a');
-  a.href = URL.createObjectURL(blob);
-  a.download = 'QM_export.xlsx';
-  a.click();
-  setTimeout(()=>URL.revokeObjectURL(a.href), 3000);
-  document.getElementById('log').textContent = "Done. Downloaded QM_export.xlsx";
-}
-
-document.getElementById('htmlFile').addEventListener('change', () => {
-  document.getElementById('runBtn').disabled = !document.getElementById('htmlFile').files.length;
-});
-document.getElementById('runBtn').addEventListener('click', run);
-</script>
-</body>
-</html>
+    const vals = Array.isArray(td.
