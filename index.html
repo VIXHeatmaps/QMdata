@@ -2,7 +2,7 @@
 <html>
 <head>
   <meta charset="utf-8">
-  <title>QuantMage Combined Exporter</title>
+  <title>QuantMage Combined Exporter (no empty columns)</title>
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <style>
     body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; margin: 24px; }
@@ -11,11 +11,15 @@
     button { padding: 8px 12px; border-radius: 8px; border: 1px solid #999; background: #f5f5f5; cursor: pointer; }
     button:disabled { opacity: .5; cursor: not-allowed; }
     .muted { color: #666; font-size: 12px; }
+    code { background: #f2f2f2; padding: 2px 6px; border-radius: 6px; }
   </style>
 </head>
 <body>
   <h1>QuantMage Combined Exporter</h1>
-  <p class="muted">Drop a saved QuantMage HTML (either $ or % view). One CSV comes out with Name, URL, $-view and %-view metrics (no Beta/R, K50/K25 blank). Runs entirely in your browser.</p>
+  <p class="muted">
+    Drop a saved QuantMage HTML (either $ or % view). One CSV comes out with Name, URL, $-view and %-view metrics.
+    <b>Columns that are empty for all rows are automatically omitted.</b> Everything runs locally in your browser.
+  </p>
   <div class="box">
     <div class="row">
       <label><b>Saved HTML:</b> <input type="file" id="htmlFile" accept=".html,.htm"></label>
@@ -23,6 +27,7 @@
     </div>
     <div id="log" class="muted" style="margin-top:8px;"></div>
   </div>
+
 <script>
 const RE_CONST = name => new RegExp(`const\\s+${name}\\s*=\\s*(".*?");`, 's');
 function parseDoubleJSON(jsStringLiteral){ const inner = JSON.parse(jsStringLiteral); return JSON.parse(inner); }
@@ -38,6 +43,7 @@ function stdev(arr){ if(arr.length<2) return 0; const m=arr.reduce((a,b)=>a+b,0)
 function maxDrawdown(values){ let peak=values[0], mdd=0; const dd=[]; for(const v of values){ peak=Math.max(peak,v); const d=v/peak-1; mdd=Math.min(mdd,d); dd.push(-d);} return {mdd, dd}; }
 function ulcerIndex(dd){ if(!dd.length) return NaN; const ms=dd.reduce((s,x)=>s+x*x,0)/dd.length; return Math.sqrt(ms); }
 function downloadCSV(name, rows){ const blob=new Blob([rows.join('\n')],{type:'text/csv'}); const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download=name; a.click(); setTimeout(()=>URL.revokeObjectURL(a.href), 3000); }
+function toCSVRow(arr){ return arr.map(v => /[",\n]/.test(v) ? `"${String(v).replace(/"/g,'""')}"` : String(v)).join(','); }
 
 async function run(){
   const file = document.getElementById('htmlFile').files[0];
@@ -51,14 +57,14 @@ async function run(){
 
   const base = "https://quantmage.app/grimoire/";
   const header = ["Name","URL","CurrentValue","AllTimePct","FromLastTrade$","FromLastTradePct","Since","CAGR","MD","K50","K25","Sharpe","Sortino","MAR","UPI","GPR","WinRate","Volatility","CumulativeReturn"];
-  const rows = [header.join(',')];
+  const table = [header];
 
-  for(const [sid, payload] of Object.entries(trading_spells)){
+  for (const [sid, payload] of Object.entries(trading_spells)){
     const td = payload.trading_data || {};
     const vals = Array.isArray(td.value_history) ? td.value_history : [];
-    if(vals.length < 3) continue;
+    if (vals.length < 3) continue;
     const dts = inferDates(vals, dates_list, td.last_value_date);
-    const x = vals.map(Number).filter(v=>v>0); if(x.length<3) continue;
+    const x = vals.map(Number).filter(v=>v>0); if (x.length < 3) continue;
 
     const rets = pctReturns(x);
     const days = Math.max((dts[dts.length-1]-dts[0])/(1000*60*60*24), 1);
@@ -81,19 +87,29 @@ async function run(){
     const cumret = growth - 1;
     const since = new Date(dts[0]).toISOString().slice(0,10);
 
-    const fmtPct = x => (x==null||isNaN(x)||!isFinite(x)) ? "" : (Math.round(x*10000)/100).toFixed(2);
-    const fmt = x => (x==null||isNaN(x)||!isFinite(x)) ? "" : (Math.round(x*100)/100).toFixed(2);
+    const pct = x => (x==null||isNaN(x)||!isFinite(x)) ? "" : (Math.round(x*10000)/100).toString();
+    const num = x => (x==null||isNaN(x)||!isFinite(x)) ? "" : (Math.round(x*100)/100).toString();
 
-    const name = (payload.name || "").trim().replace(/"/g,'""');
-    rows.push([
-      `"${name}"`, base+sid,
-      fmt(x[x.length-1]), fmtPct(cumret), "", "", since,
-      fmtPct(cagr), (mdd==null? "": fmtPct(Math.abs(mdd))), "", "", fmt(sharpe), fmt(sortino), fmt(mar), fmt(upi), fmt(gpr), fmtPct(winrate), fmtPct(vol_a), fmtPct(cumret)
-    ].join(','));
+    table.push([
+      (payload.name || "").trim(), base+sid,
+      num(x[x.length-1]), pct(cumret), "", "", since,
+      pct(cagr), (mdd==null? "": pct(Math.abs(mdd))), "", "", num(sharpe), num(sortino), num(mar), num(upi), num(gpr), pct(winrate), pct(vol_a), pct(cumret)
+    ]);
   }
 
-  downloadCSV("quantmage_combined_metrics.csv", rows);
-  document.getElementById('log').textContent = "Done. Downloaded quantmage_combined_metrics.csv";
+  // Drop columns that are empty across all rows (except Name & URL)
+  const keep = table[0].map((_, j) => {
+    if (j <= 1) return true;
+    for (let i=1; i<table.length; i++){
+      if (table[i][j] && String(table[i][j]).trim() !== "") return true;
+    }
+    return false;
+  });
+  const filtered = table.map(row => row.filter((_, j) => keep[j]));
+
+  const csv = filtered.map(r => toCSVRow(r));
+  downloadCSV("quantmage_combined_metrics.csv", csv);
+  document.getElementById('log').textContent = "Done. Downloaded quantmage_combined_metrics.csv (empty columns removed).";
 }
 
 document.getElementById('htmlFile').addEventListener('change', () => {
