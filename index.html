@@ -2,8 +2,10 @@
 <html>
 <head>
   <meta charset="utf-8">
-  <title>QuantMage Combined Exporter (no empty columns)</title>
+  <title>QuantMage → Excel Exporter</title>
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <!-- ExcelJS for XLSX generation -->
+  <script src="https://cdn.jsdelivr.net/npm/exceljs@4.4.0/dist/exceljs.min.js"></script>
   <style>
     body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; margin: 24px; }
     .box { border: 1px dashed #aaa; border-radius: 12px; padding: 16px; margin-bottom: 16px; }
@@ -15,20 +17,22 @@
   </style>
 </head>
 <body>
-  <h1>QuantMage Combined Exporter</h1>
+  <h1>QuantMage → Excel Exporter</h1>
   <p class="muted">
-    Drop a saved QuantMage HTML (either $ or % view). One CSV comes out with Name, URL, $-view and %-view metrics.
-    <b>Columns that are empty for all rows are automatically omitted.</b> Everything runs locally in your browser.
+    Choose a saved QuantMage HTML (either $ or % view). This creates a formatted <b>.xlsx</b> with:
+    <b>Metrics</b> (Gain, CAGR, MD, WinRate, Volatility, Cumulative Return in %), and <b>Correlations</b>.
+    Columns that are empty for all rows are automatically omitted. Everything runs locally.
   </p>
   <div class="box">
     <div class="row">
       <label><b>Saved HTML:</b> <input type="file" id="htmlFile" accept=".html,.htm"></label>
-      <button id="runBtn" disabled>Extract → Download <code>quantmage_combined_metrics.csv</code></button>
+      <button id="runBtn" disabled>Export → <code>QM_export.xlsx</code></button>
     </div>
     <div id="log" class="muted" style="margin-top:8px;"></div>
   </div>
 
 <script>
+/* ---------- Helpers to read embedded JSON ---------- */
 const RE_CONST = name => new RegExp(`const\\s+${name}\\s*=\\s*(".*?");`, 's');
 function parseDoubleJSON(jsStringLiteral){ const inner = JSON.parse(jsStringLiteral); return JSON.parse(inner); }
 function ymdToDate(i){ const s=String(i); return new Date(+s.slice(0,4), +s.slice(4,6)-1, +s.slice(6,8)); }
@@ -42,22 +46,40 @@ function pctReturns(values){ const out=[]; for(let i=1;i<values.length;i++){ con
 function stdev(arr){ if(arr.length<2) return 0; const m=arr.reduce((a,b)=>a+b,0)/arr.length; const v=arr.reduce((s,x)=>s+(x-m)*(x-m),0)/arr.length; return Math.sqrt(v); }
 function maxDrawdown(values){ let peak=values[0], mdd=0; const dd=[]; for(const v of values){ peak=Math.max(peak,v); const d=v/peak-1; mdd=Math.min(mdd,d); dd.push(-d);} return {mdd, dd}; }
 function ulcerIndex(dd){ if(!dd.length) return NaN; const ms=dd.reduce((s,x)=>s+x*x,0)/dd.length; return Math.sqrt(ms); }
-function downloadCSV(name, rows){ const blob=new Blob([rows.join('\n')],{type:'text/csv'}); const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download=name; a.click(); setTimeout(()=>URL.revokeObjectURL(a.href), 3000); }
-function toCSVRow(arr){ return arr.map(v => /[",\n]/.test(v) ? `"${String(v).replace(/"/g,'""')}"` : String(v)).join(','); }
+function toDateISO(d){ const z=n=>String(n).padStart(2,'0'); return `${d.getFullYear()}-${z(d.getMonth()+1)}-${z(d.getDate())}`; }
 
+/* ---------- Pearson correlation on overlapping dates ---------- */
+function corrForMaps(mapA, mapB){
+  const keysA = Object.keys(mapA), keysB = Object.keys(mapB);
+  const small = keysA.length < keysB.length ? keysA : keysB;
+  let xs=[], ys=[];
+  for(const k of small){ if(mapB[k]!==undefined && mapA[k]!==undefined){ xs.push(mapA[k]); ys.push(mapB[k]); } }
+  if(xs.length < 2) return NaN;
+  const n=xs.length, mean = a => a.reduce((p,c)=>p+c,0)/a.length;
+  const mx=mean(xs), my=mean(ys);
+  let num=0, denx=0, deny=0;
+  for(let i=0;i<n;i++){ const dx=xs[i]-mx, dy=ys[i]-my; num+=dx*dy; denx+=dx*dx; deny+=dy*dy; }
+  const den = Math.sqrt(denx*deny);
+  return den>0 ? num/den : NaN;
+}
+
+/* ---------- Main ---------- */
 async function run(){
   const file = document.getElementById('htmlFile').files[0];
   if(!file){ alert('Pick a saved HTML file first'); return; }
   const html = await file.text();
+
   const mTS = RE_CONST('trading_spells').exec(html);
   if(!mTS){ alert('Could not find "const trading_spells" in the HTML'); return; }
   const trading_spells = parseDoubleJSON(mTS[1]);
+
   const mDates = RE_CONST('dates').exec(html);
   const dates_list = mDates ? parseDoubleJSON(mDates[1]) : null;
 
   const base = "https://quantmage.app/grimoire/";
-  const header = ["Name","URL","CurrentValue","AllTimePct","FromLastTrade$","FromLastTradePct","Since","CAGR","MD","K50","K25","Sharpe","Sortino","MAR","UPI","GPR","WinRate","Volatility","CumulativeReturn"];
-  const table = [header];
+  const rowsRaw = [];
+  const names = [];
+  const returnsMaps = {}; // name -> {dateISO: dailyReturn}
 
   for (const [sid, payload] of Object.entries(trading_spells)){
     const td = payload.trading_data || {};
@@ -66,6 +88,7 @@ async function run(){
     const dts = inferDates(vals, dates_list, td.last_value_date);
     const x = vals.map(Number).filter(v=>v>0); if (x.length < 3) continue;
 
+    // Metrics
     const rets = pctReturns(x);
     const days = Math.max((dts[dts.length-1]-dts[0])/(1000*60*60*24), 1);
     const years = days/365.25;
@@ -85,31 +108,121 @@ async function run(){
     const gpr = losses<0 ? (gains/Math.abs(losses)) : Infinity;
     const mar = mdd<0 ? (cagr/Math.abs(mdd)) : Infinity;
     const cumret = growth - 1;
-    const since = new Date(dts[0]).toISOString().slice(0,10);
+    const since = toDateISO(dts[0]);
 
-    const pct = x => (x==null||isNaN(x)||!isFinite(x)) ? "" : (Math.round(x*10000)/100).toString();
-    const num = x => (x==null||isNaN(x)||!isFinite(x)) ? "" : (Math.round(x*100)/100).toString();
+    const name = (payload.name || "").trim();
+    names.push(name);
 
-    table.push([
-      (payload.name || "").trim(), base+sid,
-      num(x[x.length-1]), pct(cumret), "", "", since,
-      pct(cagr), (mdd==null? "": pct(Math.abs(mdd))), "", "", num(sharpe), num(sortino), num(mar), num(upi), num(gpr), pct(winrate), pct(vol_a), pct(cumret)
-    ]);
+    rowsRaw.push({
+      Name: name,
+      URL: base+sid,
+      CurrentValue: x[x.length-1],
+      Gain: cumret,                 // % format (AllTimePct renamed)
+      Since: since,
+      CAGR: cagr,                   // % format
+      MD: (mdd==null? null : Math.abs(mdd)), // % format
+      Sharpe: isFinite(sharpe)?sharpe:null,
+      Sortino: isFinite(sortino)?sortino:null,
+      MAR: isFinite(mar)?mar:null,
+      UPI: isFinite(upi)?upi:null,
+      GPR: isFinite(gpr)?gpr:null,
+      WinRate: winrate,             // % format
+      Volatility: vol_a,            // % format
+      CumulativeReturn: cumret      // % format
+    });
+
+    // Daily returns for correlation
+    const m = {};
+    for(let i=1;i<x.length;i++){
+      const dateISO = toDateISO(dts[i]);
+      if (x[i-1]>0) m[dateISO] = x[i]/x[i-1]-1;
+    }
+    returnsMaps[name] = m;
   }
 
-  // Drop columns that are empty across all rows (except Name & URL)
-  const keep = table[0].map((_, j) => {
-    if (j <= 1) return true;
-    for (let i=1; i<table.length; i++){
-      if (table[i][j] && String(table[i][j]).trim() !== "") return true;
-    }
-    return false;
+  // Drop columns empty across all rows (keep Name & URL)
+  const allCols = Object.keys(rowsRaw[0] || {});
+  const headers = allCols.filter(c => {
+    if (c==="Name"||c==="URL") return true;
+    return rowsRaw.some(r => r[c] !== "" && r[c] !== null && r[c] !== undefined && !(typeof r[c]==="number" && isNaN(r[c])));
   });
-  const filtered = table.map(row => row.filter((_, j) => keep[j]));
 
-  const csv = filtered.map(r => toCSVRow(r));
-  downloadCSV("quantmage_combined_metrics.csv", csv);
-  document.getElementById('log').textContent = "Done. Downloaded quantmage_combined_metrics.csv (empty columns removed).";
+  // ---- Build XLSX with ExcelJS ----
+  const wb = new ExcelJS.Workbook();
+
+  // Metrics sheet
+  const ws1 = wb.addWorksheet('Metrics', {views:[{state:'frozen', ySplit:1}]});
+  const headerRow = ws1.addRow(headers);
+  headerRow.font = { bold: true };
+  const dataRows = rowsRaw.map(r => headers.map(h => r[h]));
+  dataRows.forEach(r => ws1.addRow(r));
+
+  ws1.addTable({
+    name: 'MetricsTable',
+    ref: 'A1',
+    headerRow: true,
+    columns: headers.map(h => ({name: h})),
+    rows: dataRows,
+    style: { theme: 'TableStyleMedium9', showRowStripes: true }
+  });
+
+  headers.forEach((h, i) => {
+    const col = ws1.getColumn(i+1);
+    if (h==='Name') col.width = 48;
+    else if (h==='URL') col.width = 42;
+    else if (h==='Since') col.width = 12;
+    else col.width = 14;
+  });
+
+  // Number formats
+  const pctCols = ['Gain','CAGR','MD','WinRate','Volatility','CumulativeReturn'];
+  const twoDecCols = ['Sharpe','Sortino','MAR','UPI','GPR','CurrentValue'];
+  const colIndex = Object.fromEntries(headers.map((h,i)=>[h,i+1]));
+  for (let r=2; r<=ws1.rowCount; r++){
+    pctCols.forEach(h => { if(colIndex[h]) ws1.getCell(r, colIndex[h]).numFmt = '0.00%'; });
+    twoDecCols.forEach(h => { if(colIndex[h]) ws1.getCell(r, colIndex[h]).numFmt = '0.00'; });
+    if (colIndex['Since']) ws1.getCell(r, colIndex['Since']).numFmt = 'yyyy-mm-dd';
+  }
+
+  // Correlations sheet
+  const ws2 = wb.addWorksheet('Correlations', {views:[{state:'frozen', xSplit:1, ySplit:1}]});
+  const header2 = ['Name', ...names];
+  ws2.addRow(header2).font = { bold: true };
+  const corrRows = [];
+  for(let i=0;i<names.length;i++){
+    const row = [names[i]];
+    for(let j=0;j<names.length;j++){
+      const val = (i===j) ? 1 : corrForMaps(returnsMaps[names[i]], returnsMaps[names[j]]);
+      row.push(val);
+    }
+    corrRows.push(row);
+    ws2.addRow(row);
+  }
+  ws2.addTable({
+    name: 'CorrTable',
+    ref: 'A1',
+    headerRow: true,
+    columns: header2.map(h => ({name: h})),
+    rows: corrRows,
+    style: { theme: 'TableStyleMedium2', showRowStripes: true, showColumnStripes: true }
+  });
+  ws2.getColumn(1).width = 48;
+  for(let c=2; c<=ws2.columnCount; c++){
+    ws2.getColumn(c).width = 7;
+    for(let r=2; r<=ws2.rowCount; r++){
+      ws2.getCell(r,c).numFmt = '0.00';
+    }
+  }
+
+  // Download
+  const buf = await wb.xlsx.writeBuffer();
+  const blob = new Blob([buf], {type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'});
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'QM_export.xlsx';
+  a.click();
+  setTimeout(()=>URL.revokeObjectURL(a.href), 3000);
+  document.getElementById('log').textContent = "Done. Downloaded QM_export.xlsx";
 }
 
 document.getElementById('htmlFile').addEventListener('change', () => {
