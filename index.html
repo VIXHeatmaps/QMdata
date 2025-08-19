@@ -10,7 +10,6 @@
     .box { border: 1px dashed #aaa; border-radius: 12px; padding: 16px; margin-bottom: 16px; }
     .row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
     button { padding: 8px 12px; border-radius: 8px; border: 1px solid #999; background: #f5f5f5; cursor: pointer; }
-    button:disabled { opacity: .5; cursor: not-allowed; }
     .muted { color: #666; font-size: 12px; }
     code { background: #f2f2f2; padding: 2px 6px; border-radius: 6px; }
   </style>
@@ -19,19 +18,19 @@
   <h1>QuantMage → Excel Exporter</h1>
   <p class="muted">
     Choose a saved QuantMage HTML (either $ or % view). This creates a formatted <b>.xlsx</b> with
-    a <b>Metrics</b> sheet (Gain, CAGR, MD, WinRate, Volatility, Cumulative Return in %)
-    and a <b>Correlations</b> sheet. Columns empty for every row are omitted. Everything runs locally.
+    a <b>Metrics</b> sheet (Gain, CAGR, MD, WinRate, Volatility, Cumulative Return in %) and a
+    <b>Correlations</b> sheet. Columns empty for every row are omitted. Everything runs locally.
   </p>
   <div class="box">
     <div class="row">
       <label><b>Saved HTML:</b> <input type="file" id="htmlFile" accept=".html,.htm"></label>
-      <button id="runBtn" disabled>Export → <code>QM_export.xlsx</code></button>
+      <!-- always enabled; run() checks for a file -->
+      <button id="runBtn">Export → <code>QM_export.xlsx</code></button>
     </div>
     <div id="log" class="muted" style="margin-top:8px;"></div>
   </div>
 
 <script>
-/* ---------- helpers ---------- */
 const RE_CONST = name => new RegExp(`const\\s+${name}\\s*=\\s*(".*?");`, 's');
 function parseDoubleJSON(jsStringLiteral){ const inner = JSON.parse(jsStringLiteral); return JSON.parse(inner); }
 function ymdToDate(i){ const s=String(i); return new Date(+s.slice(0,4), +s.slice(4,6)-1, +s.slice(6,8)); }
@@ -47,7 +46,6 @@ function maxDrawdown(values){ let peak=values[0], mdd=0; const dd=[]; for(const 
 function ulcerIndex(dd){ if(!dd.length) return NaN; const ms=dd.reduce((s,x)=>s+x*x,0)/dd.length; return Math.sqrt(ms); }
 function toDateISO(d){ const z=n=>String(n).padStart(2,'0'); return `${d.getFullYear()}-${z(d.getMonth()+1)}-${z(d.getDate())}`; }
 
-/* correlation with overlap, return null for non-finite */
 function corrForMaps(mapA, mapB){
   const keys = Object.keys(mapA).length < Object.keys(mapB).length ? Object.keys(mapA) : Object.keys(mapB);
   let xs=[], ys=[];
@@ -61,28 +59,177 @@ function corrForMaps(mapA, mapB){
   if(den<=0) return null;
   let r = num/den;
   if(!isFinite(r)) return null;
-  if(r>1) r=1; if(r<-1) r=-1;   // clamp tiny FP errors
+  if(r>1) r=1; if(r<-1) r=-1;
   return r;
 }
 
-/* ---------- main ---------- */
 async function run(){
-  const file = document.getElementById('htmlFile').files[0];
-  if(!file){ alert('Pick a saved HTML file first'); return; }
-  const html = await file.text();
+  try{
+    const fileInput = document.getElementById('htmlFile');
+    const file = fileInput.files && fileInput.files[0];
+    if(!file){
+      fileInput.click();
+      document.getElementById('log').textContent = "Pick a saved QuantMage HTML first.";
+      return;
+    }
+    document.getElementById('log').textContent = "Parsing HTML…";
 
-  const mTS = RE_CONST('trading_spells').exec(html);
-  if(!mTS){ alert('Could not find "const trading_spells" in the HTML'); return; }
-  const trading_spells = parseDoubleJSON(mTS[1]);
+    const html = await file.text();
+    const mTS = RE_CONST('trading_spells').exec(html);
+    if(!mTS){ alert('Could not find "const trading_spells" in the HTML'); return; }
+    const trading_spells = parseDoubleJSON(mTS[1]);
 
-  const mDates = RE_CONST('dates').exec(html);
-  const dates_list = mDates ? parseDoubleJSON(mDates[1]) : null;
+    const mDates = RE_CONST('dates').exec(html);
+    const dates_list = mDates ? parseDoubleJSON(mDates[1]) : null;
 
-  const base = "https://quantmage.app/grimoire/";
-  const rowsRaw = [];
-  const names = [];
-  const returnsMaps = {}; // name -> {dateISO: dailyReturn}
+    const base = "https://quantmage.app/grimoire/";
+    const rowsRaw = [];
+    const names = [];
+    const returnsMaps = {};
 
-  for (const [sid, payload] of Object.entries(trading_spells)){
-    const td = payload.trading_data || {};
-    const vals = Array.isArray(td.
+    for (const [sid, payload] of Object.entries(trading_spells)){
+      const td = payload.trading_data || {};
+      const vals = Array.isArray(td.value_history) ? td.value_history : [];
+      if (vals.length < 3) continue;
+      const dts = inferDates(vals, dates_list, td.last_value_date);
+      const x = vals.map(Number).filter(v=>v>0); if (x.length < 3) continue;
+
+      const rets = pctReturns(x);
+      const days = Math.max((dts[dts.length-1]-dts[0])/(1000*60*60*24), 1);
+      const years = days/365.25;
+      const growth = x[x.length-1]/x[0];
+      const cagr = years>0 ? (growth**(1/years)-1) : NaN;
+      const {mdd, dd} = maxDrawdown(x);
+      const ui = ulcerIndex(dd);
+      const upi = (ui>0) ? (cagr/ui) : NaN;
+      const vol_d = stdev(rets), vol_a = vol_d*Math.sqrt(252);
+      const mean_d = rets.reduce((a,b)=>a+b,0)/rets.length;
+      const sharpe = vol_d>0 ? (mean_d/vol_d)*Math.sqrt(252) : NaN;
+      const downs = rets.filter(r=>r<0);
+      const sortino = downs.length ? (mean_d/stdev(downs))*Math.sqrt(252) : null;
+      const winrate = rets.filter(r=>r>0).length/rets.length;
+      const gains = rets.filter(r=>r>0).reduce((a,b)=>a+b,0);
+      const losses = rets.filter(r=>r<0).reduce((a,b)=>a+b,0);
+      const gpr = losses<0 ? (gains/Math.abs(losses)) : null;
+      const mar = mdd<0 ? (cagr/Math.abs(mdd)) : null;
+      const cumret = growth - 1;
+      const since = toDateISO(dts[0]);
+
+      const name = (payload.name || "").trim();
+      names.push(name);
+
+      rowsRaw.push({
+        Name: name,
+        URL: base+sid,
+        CurrentValue: x[x.length-1],
+        Gain: cumret,                               // %
+        Since: since,
+        CAGR: cagr,                                 // %
+        MD: (mdd==null? null : Math.abs(mdd)),      // %
+        Sharpe: isFinite(sharpe)?sharpe:null,
+        Sortino: isFinite(sortino)?sortino:null,
+        MAR: isFinite(mar)?mar:null,
+        UPI: isFinite(upi)?upi:null,
+        GPR: isFinite(gpr)?gpr:null,
+        WinRate: winrate,                           // %
+        Volatility: vol_a,                          // %
+        CumulativeReturn: cumret                    // %
+      });
+
+      const m = {};
+      for(let i=1;i<x.length;i++){
+        const dateISO = toDateISO(dts[i]);
+        if (x[i-1]>0) m[dateISO] = x[i]/x[i-1]-1;
+      }
+      returnsMaps[name] = m;
+    }
+
+    const allCols = Object.keys(rowsRaw[0] || {});
+    const headers = allCols.filter(c => {
+      if (c==="Name"||c==="URL") return true;
+      return rowsRaw.some(r => r[c] !== "" && r[c] !== null && r[c] !== undefined && !(typeof r[c]==="number" && isNaN(r[c])));
+    });
+
+    const wb = new ExcelJS.Workbook();
+
+    // Metrics
+    const ws1 = wb.addWorksheet('Metrics', {views:[{state:'frozen', ySplit:1}]});
+    const dataRows = rowsRaw.map(r => headers.map(h => r[h]));
+    ws1.addTable({
+      name: 'MetricsTable',
+      ref: 'A1',
+      headerRow: true,
+      columns: headers.map(h => ({name: h})),
+      rows: dataRows,
+      style: { theme: 'TableStyleMedium9', showRowStripes: true }
+    });
+    ws1.getRow(1).font = { bold: true };
+    headers.forEach((h, i) => {
+      const col = ws1.getColumn(i+1);
+      if (h==='Name') col.width = 48;
+      else if (h==='URL') col.width = 42;
+      else if (h==='Since') col.width = 12;
+      else col.width = 14;
+    });
+    const pctCols = ['Gain','CAGR','MD','WinRate','Volatility','CumulativeReturn'];
+    const twoDecCols = ['Sharpe','Sortino','MAR','UPI','GPR','CurrentValue'];
+    const colIndex = Object.fromEntries(headers.map((h,i)=>[h,i+1]));
+    for (let r=2; r<=dataRows.length+1; r++){
+      pctCols.forEach(h => { if(colIndex[h]) ws1.getCell(r, colIndex[h]).numFmt = '0.00%'; });
+      twoDecCols.forEach(h => { if(colIndex[h]) ws1.getCell(r, colIndex[h]).numFmt = '0.00'; });
+      if (colIndex['Since']) ws1.getCell(r, colIndex['Since']).numFmt = 'yyyy-mm-dd';
+    }
+
+    // Correlations
+    const ws2 = wb.addWorksheet('Correlations', {views:[{state:'frozen', xSplit:1, ySplit:1}]});
+    const header2 = ['Name', ...names];
+    const corrRows = [];
+    for(let i=0;i<names.length;i++){
+      const row = [names[i]];
+      for(let j=0;j<names.length;j++){
+        let v = (i===j) ? 1 : corrForMaps(returnsMaps[names[i]], returnsMaps[names[j]]);
+        row.push((v==null || !isFinite(v)) ? null : v);
+      }
+      corrRows.push(row);
+    }
+    ws2.addTable({
+      name: 'CorrTable',
+      ref: 'A1',
+      headerRow: true,
+      columns: header2.map(h => ({name: h})),
+      rows: corrRows,
+      style: { theme: 'TableStyleMedium2', showRowStripes: true, showColumnStripes: true }
+    });
+    ws2.getRow(1).font = { bold: true };
+    ws2.getColumn(1).width = 48;
+    for(let c=2; c<=names.length+1; c++){
+      ws2.getColumn(c).width = 7;
+      for(let r=2; r<=corrRows.length+1; r++){
+        ws2.getCell(r,c).numFmt = '0.00';
+      }
+    }
+
+    // Download
+    const buf = await wb.xlsx.writeBuffer();
+    const blob = new Blob([buf], {type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'});
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'QM_export.xlsx';
+    a.click();
+    setTimeout(()=>URL.revokeObjectURL(a.href), 3000);
+    document.getElementById('log').textContent = "Done. Downloaded QM_export.xlsx";
+  } catch (err){
+    console.error(err);
+    document.getElementById('log').textContent = "Error: " + (err && err.message ? err.message : err);
+    alert("Something went wrong creating the XLSX. Check the console for details.");
+  }
+}
+
+// be extra safe: hook both events
+const fileEl = document.getElementById('htmlFile');
+fileEl.addEventListener('change', () => { document.getElementById('log').textContent = fileEl.files.length ? fileEl.files[0].name : ""; });
+fileEl.addEventListener('input',  () => { document.getElementById('log').textContent = fileEl.files.length ? fileEl.files[0].name : ""; });
+document.getElementById('runBtn').addEventListener('click', run);
+</script>
+</body>
+</html>
