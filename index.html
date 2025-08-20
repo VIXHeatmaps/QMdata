@@ -36,7 +36,6 @@
 <script>
 /* ===== Colors ===== */
 const MINT_HEADER = 'FFAAF0D1';
-const MINT_BAND   = 'FFDFF7F3';
 const WHITE_FILL  = 'FFFFFFFF';
 
 /* ===== Regex & helpers ===== */
@@ -65,7 +64,7 @@ function stdev(arr){ if(arr.length<2) return 0; const m=arr.reduce((a,b)=>a+b,0)
 function maxDrawdown(values){ let peak=values[0], mdd=0, dd=[]; for(const v of values){ peak=Math.max(peak,v); const d=v/peak-1; mdd=Math.min(mdd,d); dd.push(-d);} return {mdd, dd}; }
 function ulcerIndex(dd){ if(!dd.length) return NaN; const ms=dd.reduce((s,x)=>s+x*x,0)/dd.length; return Math.sqrt(ms); }
 
-/* --- Flow helpers (metrics only; UI unchanged) --- */
+/* --- Flows helpers --- */
 function toYMDIntLocal(d){ return d.getFullYear()*10000 + (d.getMonth()+1)*100 + d.getDate(); }
 function ymdIntToISO(n){
   if(n==null || !isFinite(n)) return '';
@@ -74,8 +73,7 @@ function ymdIntToISO(n){
   return `${y}-${String(m).padStart(2,'0')}-${String(d).padStart(2,'0')}`;
 }
 
-// Robust unitization: for each flow ratio r at index k (first date >= flow.date),
-// choose orientation (multiply or divide) that makes the boundary jump ~ 0.
+// Robust unitization: at each flow, choose multiply/divide so the boundary jump is ~0.
 function unitizeByCashFlows(values, dates, cashFlows){
   const n = values.length;
   if (!cashFlows || !cashFlows.length || n===0) return values.slice();
@@ -84,7 +82,7 @@ function unitizeByCashFlows(values, dates, cashFlows){
     .filter(f=>f && isFinite(f.date) && isFinite(f.ratio) && f.ratio>0)
     .sort((a,b)=>a.date - b.date);
 
-  // Precompute first index k where date >= flow.date
+  // find first index k where date >= flow.date
   const kList = flows.map(f => {
     const target = f.date;
     let k = 0;
@@ -93,33 +91,29 @@ function unitizeByCashFlows(values, dates, cashFlows){
   });
 
   const out = new Array(n);
-  let factor = 1;
-  let nextFlow = 0;
+  let factor = 1, next = 0;
 
   for (let i=0; i<n; i++){
-    // Apply all flows whose effective index is i
-    while (nextFlow < flows.length && kList[nextFlow] === i){
-      const r = Number(flows[nextFlow].ratio);
-
-      if (i > 0 && isFinite(values[i-1]) && isFinite(values[i]) && values[i-1]>0 && values[i]>0){
+    while (next < flows.length && kList[next] === i){
+      const r = Number(flows[next].ratio);
+      if (i>0 && values[i-1]>0 && values[i]>0){
         const prev = values[i-1], curr = values[i];
-        const jumpMul = Math.abs((curr * factor * r) / (prev * factor) - 1); // apply r to later values
-        const jumpDiv = Math.abs((curr * factor / r) / (prev * factor) - 1); // apply 1/r to later values
-        factor = (jumpMul < jumpDiv) ? factor * r : factor / r;
-      }else{
-        // Fallback if we can't compare
-        factor /= r; // default to dividing later values by r
+        const mulJump = Math.abs((curr*factor*r)/(prev*factor) - 1);
+        const divJump = Math.abs((curr*factor/r)/(prev*factor) - 1);
+        factor = (mulJump < divJump) ? factor*r : factor/r;
+      } else {
+        factor /= r;
       }
-      nextFlow++;
+      next++;
     }
-    out[i] = values[i] * factor;
+    out[i] = values[i]*factor;
   }
   return out;
 }
 
-/* Parse the rendered table to map Name → Since (and optionally Gain/All Time %) */
-function extractTableMaps(fullHTML){
-  const byName = { since:{}, gain:{} };
+/* Parse the rendered table to map Name → Since (YYYY-MM-DD) */
+function extractSinceMapFromHTML(fullHTML){
+  const map = {};
   try{
     const dom = new DOMParser().parseFromString(fullHTML, 'text/html');
     const tables = Array.from(dom.querySelectorAll('table'));
@@ -127,8 +121,7 @@ function extractTableMaps(fullHTML){
       const ths = Array.from(t.querySelectorAll('thead th, tr th')).map(th=>th.textContent.trim());
       const nameIdx = ths.findIndex(h => /name/i.test(h));
       const sinceIdx= ths.findIndex(h => /since/i.test(h));
-      const gainIdx = ths.findIndex(h => /^all time$|^gain$/i.test(h)); // support "All Time" or "Gain"
-      if (nameIdx === -1) continue;
+      if (nameIdx === -1 || sinceIdx === -1) continue;
 
       const rows = Array.from(t.querySelectorAll('tbody tr')).length
         ? Array.from(t.querySelectorAll('tbody tr'))
@@ -138,22 +131,15 @@ function extractTableMaps(fullHTML){
         const tds = Array.from(tr.querySelectorAll('td'));
         if (!tds.length) continue;
         const name = (tds[nameIdx]?.textContent || '').trim();
-        if (!name) continue;
-
-        if (sinceIdx !== -1){
-          const sinceRaw = (tds[sinceIdx]?.textContent || '').trim();
-          const m = sinceRaw.match(/(\d{4})[\/\-.](\d{1,2})[\/\-.](\d{1,2})/);
-          if (m){ byName.since[name] = `${m[1]}-${String(m[2]).padStart(2,'0')}-${String(m[3]).padStart(2,'0')}`; }
-        }
-        if (gainIdx !== -1){
-          const gtxt = (tds[gainIdx]?.textContent || '').trim();
-          const g = gtxt.match(/-?\d+(\.\d+)?\s*%/);
-          if (g){ byName.gain[name] = Number(g[0].replace(/[^0-9.\-]/g,''))/100; }
+        const sinceRaw = (tds[sinceIdx]?.textContent || '').trim();
+        const m = sinceRaw.match(/(\d{4})[\/\-.](\d{1,2})[\/\-.](\d{1,2})/);
+        if (name && m){
+          map[name] = `${m[1]}-${String(m[2]).padStart(2,'0')}-${String(m[3]).padStart(2,'0')}`;
         }
       }
     }
   }catch(e){ /* ignore */ }
-  return byName;
+  return map;
 }
 
 /* Correlations */
@@ -196,10 +182,8 @@ async function run(){
     const mDates = RE_CONST('dates').exec(html);
     const dates_list = mDates ? parseDoubleJSON(mDates[1]) : null;
 
-    // 3) table maps
-    const tbl = extractTableMaps(html);
-    const sinceByName = tbl.since;
-    const qmGainByName = tbl.gain; // may be empty
+    // 3) since dates from table
+    const sinceByName = extractSinceMapFromHTML(html);
 
     const base = "https://quantmage.app/grimoire/";
     const rows = [];
@@ -236,7 +220,7 @@ async function run(){
       const dts = dtsFull.slice(anchor);
       if (x.length < 2) continue;
 
-      // Flow-neutral, since-anchored cumulative return (site's "All Time" in the table)
+      // Time-weighted, since-anchored cumulative return
       let gain = null;
       if (x[0] > 0) gain = x[x.length-1]/x[0] - 1;
 
@@ -256,9 +240,9 @@ async function run(){
       const vol_d = stdev(rets), vol_a = vol_d * Math.sqrt(252);
       const mean_d= rets.length ? rets.reduce((a,b)=>a+b,0)/rets.length : null;
 
-      // Proper Sortino: downside deviation relative to 0, include zeros for positive days
-      const downs = rets.map(r => (r < 0 ? r : 0));
-      const ddev  = Math.sqrt(downs.reduce((s,r)=>s + r*r, 0) / rets.length);
+      // Sortino: downside deviation from negatives only (to match site)
+      const neg   = rets.filter(r => r < 0);
+      const ddev  = (neg.length ? Math.sqrt(neg.reduce((s,r)=>s + r*r, 0) / neg.length) : null);
       const sharpe= (vol_d>0 && mean_d!=null) ? (mean_d/vol_d)*Math.sqrt(252) : null;
       const sort  = (ddev>0 && mean_d!=null) ? (mean_d/ddev)*Math.sqrt(252) : null;
 
@@ -270,7 +254,6 @@ async function run(){
         URL: base+sid,
         CurrentValue: vals[vals.length-1],                 // raw value
         Gain: gain,                                        // flow-neutral since-anchored cumulative return
-        QMGain: (name in qmGainByName) ? qmGainByName[name] : null, // site's printed All Time / Gain if available
         Since: toDateISO(dts[0]),
         HasFlows: (Array.isArray(td.cash_flow_history) && td.cash_flow_history.length>0) ? 'Yes' : 'No',
         FlowCount: Array.isArray(td.cash_flow_history) ? td.cash_flow_history.length : 0,
@@ -300,16 +283,12 @@ async function run(){
 
     if (!rows.length){ alert("No rows parsed. Double-check the HTML is a saved QuantMage page."); return; }
 
-    // Sort by Gain desc (missing values treated as -∞)
-    rows.sort((a,b)=>{
-      const ga = (typeof a.Gain === 'number') ? a.Gain : -Infinity;
-      const gb = (typeof b.Gain === 'number') ? b.Gain : -Infinity;
-      return gb - ga;
-    });
+    // >>> Sort output by Column A (Name), A–Z
+    rows.sort((a,b)=> (a.Name||'').localeCompare(b.Name||''));
 
     // Keep non-empty columns (always keep core + flow flags)
     const allCols = Object.keys(rows[0]);
-    const must = new Set(['Name','URL','Gain','Since','HasFlows','FlowCount','LastFlow','QMGain']);
+    const must = new Set(['Name','URL','Gain','Since','HasFlows','FlowCount','LastFlow']);
     const headers = allCols.filter(c=>{
       if (must.has(c)) return true;
       return rows.some(r => r[c] !== "" && r[c] !== null && r[c] !== undefined && !(typeof r[c]==="number" && isNaN(r[c])));
@@ -318,7 +297,7 @@ async function run(){
     /* ===== Build workbook ===== */
     const wb = new ExcelJS.Workbook();
 
-    // ---- Metrics (mint header + alternating mint bands) ----
+    // ---- Metrics (use Excel's built-in banding so stripes stay after sorts) ----
     const ws1 = wb.addWorksheet('Metrics', {views:[{state:'frozen', ySplit:1}]});
     const metricsRows = rows.map(r => headers.map(h => r[h]));
     ws1.addTable({
@@ -327,10 +306,10 @@ async function run(){
       headerRow: true,
       columns: headers.map(h => ({name: h})),
       rows: metricsRows,
-      style: { theme: 'TableStyleLight1', showRowStripes: false, showColumnStripes: false }
+      style: { theme: 'TableStyleLight1', showRowStripes: true, showColumnStripes: false }
     });
 
-    // Header style
+    // Header style (mint)
     ws1.getRow(1).font = { bold: true };
     for (let c=1; c<=headers.length; c++){
       ws1.getCell(1,c).fill = { type:'pattern', pattern:'solid', fgColor:{argb: MINT_HEADER} };
@@ -346,7 +325,7 @@ async function run(){
     });
 
     // Number formats
-    const pctCols = ['Gain','QMGain','CAGR','MD','WinRate','Volatility','CumulativeReturn'];
+    const pctCols = ['Gain','CAGR','MD','WinRate','Volatility','CumulativeReturn'];
     const twoDec  = ['Sharpe','Sortino','MAR','UPI','GPR'];
     const colIndex= Object.fromEntries(headers.map((h,i)=>[h,i+1]));
     for (let r=2; r<=metricsRows.length+1; r++){
@@ -354,14 +333,6 @@ async function run(){
       twoDec.forEach(h  => { if(colIndex[h]) ws1.getCell(r, colIndex[h]).numFmt = '0.00'; });
       if (colIndex['Since']) ws1.getCell(r, colIndex['Since']).numFmt = 'yyyy-mm-dd';
       if (colIndex['CurrentValue']) ws1.getCell(r, colIndex['CurrentValue']).numFmt = '$#,##0.00';
-    }
-
-    // Alternating bands
-    for (let r=2; r<=metricsRows.length+1; r++){
-      const fill = (r%2===0)
-        ? { type:'pattern', pattern:'solid', fgColor:{argb: MINT_BAND} }
-        : { type:'pattern', pattern:'solid', fgColor:{argb: WHITE_FILL} };
-      for (let c=1; c<=headers.length; c++) ws1.getCell(r,c).fill = fill;
     }
 
     // ---- Correlations ----
