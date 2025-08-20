@@ -28,38 +28,73 @@
   <div class="box">
     <div class="row">
       <label><b>Saved HTML:</b> <input type="file" id="htmlFile" accept=".html,.htm"></label>
-      <button id="runBtn">Export → <code>.xlsx</code></button>
+      <!-- Static label; actual download includes the date -->
+      <button id="runBtn">Export → <code>QM_export.xlsx</code></button>
     </div>
     <div id="log" class="muted" style="margin-top:8px;"></div>
   </div>
 
 <script>
 /* ===== Config =====
-   Neutral table style; mint header; alternating white & very-light-mint row banding.
+   Neutral table style; mint header; alternating white & light-mint row banding.
 */
-const METRICS_TABLE_STYLE = 'TableStyleLight1';   // neutral; we style ourselves
+const METRICS_TABLE_STYLE = 'TableStyleLight1'; // neutral; we style ourselves
 
 // Magic-mint family
 const MINT_HEADER = 'FFAAF0D1';  // header: Magic Mint (#AAF0D1)
-const MINT_BAND = 'FFD7F4EC';  // med mint for bands (#EFFFFB)
+const MINT_BAND   = 'FFDFF7F3';  // a touch darker very-light mint for bands (#DFF7F3)
 const WHITE_FILL  = 'FFFFFFFF';
 
-/* ---------- helpers ---------- */
-const RE_CONST = name => new RegExp(`const\\s+${name}\\s*=\\s*(".*?");`, 's');
-function parseDoubleJSON(jsStringLiteral){ const inner = JSON.parse(jsStringLiteral); return JSON.parse(inner); }
-function ymdToDate(i){ const s=String(i); return new Date(+s.slice(0,4), +s.slice(4,6)-1, +s.slice(8,10)); } // fixed day slice
-function inferDates(vals, datesList, lastValueDate){
-  const n=vals.length;
-  if(Array.isArray(datesList)&&datesList.length>=n){ return datesList.slice(-n).map(d=>new Date(String(d).slice(0,4), String(d).slice(4,6)-1, String(d).slice(6,8))); }
-  const end=(typeof lastValueDate==='number')? new Date(String(lastValueDate).slice(0,4), String(lastValueDate).slice(4,6)-1, String(lastValueDate).slice(6,8)) : new Date();
-  const out=[]; for(let i=0;i<n;i++){ const d=new Date(end); d.setDate(d.getDate()-(n-1-i)); out.push(d);} return out;
+/* ---------- helpers (robust date alignment) ---------- */
+// Robust YYYYMMDD → Date
+function ymdToDate(i){
+  const s = String(i).replace(/\D/g,'');        // tolerate strings
+  const p = s.padStart(8, '0');
+  const y = +p.slice(0,4), m = +p.slice(4,6)-1, d = +p.slice(6,8);
+  return new Date(y, m, d);
 }
-function pctReturns(values){ const out=[]; for(let i=1;i<values.length;i++){ const a=values[i-1], b=values[i]; if(a>0) out.push(b/a-1);} return out; }
-function stdev(arr){ if(arr.length<2) return 0; const m=arr.reduce((a,b)=>a+b,0)/arr.length; const v=arr.reduce((s,x)=>s+(x-m)*(x-m),0)/arr.length; return Math.sqrt(v); }
-function maxDrawdown(values){ let peak=values[0], mdd=0; const dd=[]; for(const v of values){ peak=Math.max(peak,v); const d=v/peak-1; mdd=Math.min(mdd,d); dd.push(-d);} return {mdd, dd}; }
-function ulcerIndex(dd){ if(!dd.length) return NaN; const ms=dd.reduce((s,x)=>s+x*x,0)/dd.length; return Math.sqrt(ms); }
+
+// Prefer QuantMage-provided dates; otherwise synthesize by counting back from last_value_date
+function inferDates(vals, datesList, lastValueDate){
+  const n = vals.length;
+  if (Array.isArray(datesList) && datesList.length >= n){
+    return datesList.slice(-n).map(ymdToDate);
+  }
+  const end = (typeof lastValueDate === 'number') ? ymdToDate(lastValueDate) : new Date();
+  const out = [];
+  for (let i=0; i<n; i++){
+    const d = new Date(end);
+    d.setDate(d.getDate() - (n - 1 - i));
+    out.push(d);
+  }
+  return out;
+}
+
 function toDateISO(d){ const z=n=>String(n).padStart(2,'0'); return `${d.getFullYear()}-${z(d.getMonth()+1)}-${z(d.getDate())}`; }
 function todayStamp(){ const d=new Date(), z=n=>String(n).padStart(2,'0'); return `${d.getFullYear()}-${z(d.getMonth()+1)}-${z(d.getDate())}`; }
+
+// Stats helpers
+function stdev(arr){
+  if(arr.length<2) return 0;
+  const m = arr.reduce((a,b)=>a+b,0)/arr.length;
+  const v = arr.reduce((s,x)=>s+(x-m)*(x-m),0)/arr.length;
+  return Math.sqrt(v);
+}
+function maxDrawdown(values){
+  let peak = values[0], mdd = 0, dd = [];
+  for (const v of values){
+    peak = Math.max(peak, v);
+    const d = v/peak - 1;
+    mdd = Math.min(mdd, d);
+    dd.push(-d);
+  }
+  return { mdd, dd };
+}
+function ulcerIndex(dd){
+  if(!dd.length) return NaN;
+  const ms = dd.reduce((s,x)=>s+x*x,0)/dd.length;
+  return Math.sqrt(ms);
+}
 
 /* correlation with overlap, return null for non-finite */
 function corrForMaps(mapA, mapB){
@@ -75,7 +110,7 @@ function corrForMaps(mapA, mapB){
   let r = num/den; if(!isFinite(r)) return null; if(r>1) r=1; if(r<-1) r=-1; return r;
 }
 
-/* color mapping: 0→white; +1→pale red; −1→pale blue (for Correlations heatmap) */
+/* color mapping for Correlations: 0→white, +1→pale red, −1→pale blue */
 function corrToARGB(v){
   if (v==null || !isFinite(v)) return null;
   const clamp = x => Math.max(-1, Math.min(1, x)); v = clamp(v);
@@ -93,6 +128,11 @@ async function run(){
     document.getElementById('log').textContent = "Parsing HTML…";
 
     const html = await file.text();
+
+    // Pull const trading_spells / dates from the saved HTML (double-encoded JSON)
+    const RE_CONST = name => new RegExp(`const\\s+${name}\\s*=\\s*(".*?");`, 's');
+    function parseDoubleJSON(jsStringLiteral){ const inner = JSON.parse(jsStringLiteral); return JSON.parse(inner); }
+
     const mTS = RE_CONST('trading_spells').exec(html);
     if(!mTS){ alert('Could not find "const trading_spells" in the HTML'); return; }
     const trading_spells = parseDoubleJSON(mTS[1]);
@@ -105,40 +145,62 @@ async function run(){
     const names = [];
     const returnsMaps = {};
 
+    // -------- Parse each spell safely (aligned dates, first-positive start) --------
     for (const [sid, payload] of Object.entries(trading_spells)){
       const td = payload.trading_data || {};
-      const vals = Array.isArray(td.value_history) ? td.value_history : [];
-      if (vals.length < 3) continue;
-      const dts = inferDates(vals, dates_list, td.last_value_date);
-      const x = vals.map(Number).filter(v=>v>0); if (x.length < 3) continue;
+      const rawVals = Array.isArray(td.value_history) ? td.value_history : [];
+      if (rawVals.length < 3) continue;
 
-      const rets = pctReturns(x);
-      const days = Math.max((dts[dts.length-1]-dts[0])/(1000*60*60*24), 1);
-      const years = days/365.25;
-      const growth = x[x.length-1]/x[0];
-      const cagr = years>0 ? (growth**(1/years)-1) : NaN;
+      const vals = rawVals.map(Number);
+      const dtsFull = inferDates(vals, dates_list, td.last_value_date);
+
+      // start at first strictly-positive value and keep dates aligned
+      let first = vals.findIndex(v => v > 0);
+      if (first === -1 || (vals.length - first) < 3) continue;
+
+      const x   = vals.slice(first);
+      const dts = dtsFull.slice(first);
+
+      // daily returns using aligned series (skip any step with non-positive)
+      const rets = [];
+      for (let i=1; i<x.length; i++){
+        const a = x[i-1], b = x[i];
+        if (a > 0 && b > 0) rets.push(b/a - 1);
+      }
+      if (rets.length < 2) continue;
+
+      // Metrics
+      const days   = Math.max((dts[dts.length-1] - dts[0]) / (1000*60*60*24), 1);
+      const years  = days / 365.25; // matches site better when dates are aligned
+      const growth = x[x.length-1] / x[0];
+      const cagr   = years > 0 ? Math.pow(growth, 1/years) - 1 : NaN;
+
       const {mdd, dd} = maxDrawdown(x);
-      const ui = ulcerIndex(dd);
-      const upi = (ui>0) ? (cagr/ui) : NaN;
-      const vol_d = stdev(rets), vol_a = vol_d*Math.sqrt(252);
-      const mean_d = rets.reduce((a,b)=>a+b,0)/rets.length;
-      const sharpe = vol_d>0 ? (mean_d/vol_d)*Math.sqrt(252) : NaN;
-      const downs = rets.filter(r=>r<0);
-      const sortino = downs.length ? (mean_d/stdev(downs))*Math.sqrt(252) : null;
-      const winrate = rets.filter(r=>r>0).length/rets.length;
-      const gains = rets.filter(r=>r>0).reduce((a,b)=>a+b,0);
-      const losses = rets.filter(r=>r<0).reduce((a,b)=>a+b,0);
-      const gpr = losses<0 ? (gains/Math.abs(losses)) : null;
-      const mar = mdd<0 ? (cagr/Math.abs(mdd)) : null;
-      const cumret = growth - 1;
-      const since = toDateISO(dts[0]);
+      const ui   = ulcerIndex(dd);
+      const upi  = (ui>0) ? (cagr/ui) : NaN;
+
+      const vol_d   = stdev(rets);
+      const vol_a   = vol_d * Math.sqrt(252);
+      const mean_d  = rets.reduce((a,b)=>a+b,0)/rets.length;
+      const sharpe  = vol_d>0 ? (mean_d/vol_d) * Math.sqrt(252) : NaN;
+      const downs   = rets.filter(r=>r<0);
+      const sortino = downs.length ? (mean_d / stdev(downs)) * Math.sqrt(252) : null;
+
+      const winrate = rets.filter(r=>r>0).length / rets.length;
+      const gains   = rets.filter(r=>r>0).reduce((a,b)=>a+b,0);
+      const losses  = rets.filter(r=>r<0).reduce((a,b)=>a+b,0);
+      const gpr     = losses < 0 ? (gains/Math.abs(losses)) : null;
+
+      const mar     = mdd < 0 ? (cagr/Math.abs(mdd)) : null;
+      const cumret  = growth - 1;
+      const since   = toDateISO(dts[0]);
 
       const name = (payload.name || "").trim();
       names.push(name);
 
       rowsRaw.push({
         Name: name,
-        URL: base+sid,
+        URL: base + sid,
         CurrentValue: x[x.length-1],
         Gain: cumret,                               // %
         Since: since,
@@ -154,10 +216,13 @@ async function run(){
         CumulativeReturn: cumret                    // %
       });
 
+      // Returns map for correlations (aligned)
       const m = {};
-      for(let i=1;i<x.length;i++){
-        const dateISO = toDateISO(dts[i]);
-        if (x[i-1]>0) m[dateISO] = x[i]/x[i-1]-1;
+      for (let i=1; i<x.length; i++){
+        const a = x[i-1], b = x[i];
+        if (a > 0 && b > 0){
+          m[toDateISO(dts[i])] = b/a - 1;
+        }
       }
       returnsMaps[name] = m;
     }
