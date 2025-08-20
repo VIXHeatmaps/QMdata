@@ -4,6 +4,11 @@
   <meta charset="utf-8">
   <title>QuantMage → Excel Exporter</title>
   <meta name="viewport" content="width=device-width, initial-scale=1">
+
+  <!-- Favicon: mint tile with “QM” -->
+  <link rel="icon" type="image/svg+xml"
+        href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect rx='12' width='64' height='64' fill='%23121a24'/%3E%3Crect x='6' y='6' width='52' height='52' rx='10' fill='%23AAF0D1'/%3E%3Ctext x='32' y='41' font-family='Arial, Helvetica, sans-serif' font-size='28' text-anchor='middle' fill='%23121a24' font-weight='700'%3EQM%3C/text%3E%3C/svg%3E">
+
   <script src="https://cdn.jsdelivr.net/npm/exceljs@4.4.0/dist/exceljs.min.js"></script>
   <style>
     body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; margin: 24px; }
@@ -29,11 +34,13 @@
   </div>
 
 <script>
-/* ===== Config: pick the Metrics table color =====
-   Green (this build):  'TableStyleMedium4'
-   Old Blue (fallback): 'TableStyleMedium9'
+/* ===== Config =====
+   Use a neutral table style, then paint a mint header (no row banding).
 */
-const METRICS_TABLE_STYLE = 'TableStyleMedium4';
+const METRICS_TABLE_STYLE = 'TableStyleLight1';   // neutral; we style header ourselves
+
+// Magic-mint (https://en.wikipedia.org/wiki/Spring_green#Magic_mint)
+const MINT_HEADER = 'FFAAF0D1'; // #AAF0D1
 
 /* ---------- helpers ---------- */
 const RE_CONST = name => new RegExp(`const\\s+${name}\\s*=\\s*(".*?");`, 's');
@@ -65,7 +72,7 @@ function corrForMaps(mapA, mapB){
   let r = num/den; if(!isFinite(r)) return null; if(r>1) r=1; if(r<-1) r=-1; return r;
 }
 
-/* color mapping: 0→white; +1→pale red; −1→pale blue */
+/* color mapping: 0→white; +1→pale red; −1→pale blue (for Correlations heatmap) */
 function corrToARGB(v){
   if (v==null || !isFinite(v)) return null;
   const clamp = x => Math.max(-1, Math.min(1, x)); v = clamp(v);
@@ -161,7 +168,7 @@ async function run(){
 
     const wb = new ExcelJS.Workbook();
 
-    /* ---- Metrics: TABLE with banding (green by default) ---- */
+    /* ---- Metrics: neutral table + mint header ---- */
     const ws1 = wb.addWorksheet('Metrics', {views:[{state:'frozen', ySplit:1}]});
     const metricsRows = rowsRaw.map(r => headers.map(h => r[h]));
     ws1.addTable({
@@ -170,9 +177,14 @@ async function run(){
       headerRow: true,
       columns: headers.map(h => ({name: h})),
       rows: metricsRows,
-      style: { theme: METRICS_TABLE_STYLE, showRowStripes: true, showColumnStripes: false }
+      style: { theme: METRICS_TABLE_STYLE, showRowStripes: false, showColumnStripes: false }
     });
+
+    // Header styling
     ws1.getRow(1).font = { bold: true };
+    for (let c=1; c<=headers.length; c++){
+      ws1.getCell(1,c).fill = { type:'pattern', pattern:'solid', fgColor:{argb: MINT_HEADER} };
+    }
 
     // widths
     headers.forEach((h, i) => {
