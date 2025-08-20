@@ -19,18 +19,18 @@
   <p class="muted">
     Choose a saved QuantMage HTML (either $ or % view). This creates a formatted <b>.xlsx</b> with
     a <b>Metrics</b> sheet (Gain, CAGR, MD, WinRate, Volatility, Cumulative Return in %) and a
-    <b>Correlations</b> sheet. Columns empty for every row are omitted. Everything runs locally.
+    <b>Correlations</b> sheet (with a diverging heatmap). Columns empty for every row are omitted. Everything runs locally.
   </p>
   <div class="box">
     <div class="row">
       <label><b>Saved HTML:</b> <input type="file" id="htmlFile" accept=".html,.htm"></label>
-      <!-- always enabled; run() checks for a file -->
       <button id="runBtn">Export → <code>QM_export.xlsx</code></button>
     </div>
     <div id="log" class="muted" style="margin-top:8px;"></div>
   </div>
 
 <script>
+/* ---------- helpers ---------- */
 const RE_CONST = name => new RegExp(`const\\s+${name}\\s*=\\s*(".*?");`, 's');
 function parseDoubleJSON(jsStringLiteral){ const inner = JSON.parse(jsStringLiteral); return JSON.parse(inner); }
 function ymdToDate(i){ const s=String(i); return new Date(+s.slice(0,4), +s.slice(4,6)-1, +s.slice(6,8)); }
@@ -46,6 +46,7 @@ function maxDrawdown(values){ let peak=values[0], mdd=0; const dd=[]; for(const 
 function ulcerIndex(dd){ if(!dd.length) return NaN; const ms=dd.reduce((s,x)=>s+x*x,0)/dd.length; return Math.sqrt(ms); }
 function toDateISO(d){ const z=n=>String(n).padStart(2,'0'); return `${d.getFullYear()}-${z(d.getMonth()+1)}-${z(d.getDate())}`; }
 
+/* correlation with overlap, return null for non-finite */
 function corrForMaps(mapA, mapB){
   const keys = Object.keys(mapA).length < Object.keys(mapB).length ? Object.keys(mapA) : Object.keys(mapB);
   let xs=[], ys=[];
@@ -63,15 +64,33 @@ function corrForMaps(mapA, mapB){
   return r;
 }
 
+/* color mapping: 0→white; +1→pale red; −1→pale blue */
+function corrToARGB(v){
+  if (v==null || !isFinite(v)) return null;
+  const clamp = x => Math.max(-1, Math.min(1, x));
+  v = clamp(v);
+  const lerp = (a,b,t)=>Math.round(a+(b-a)*t);
+  const hex = n => n.toString(16).padStart(2,'0').toUpperCase();
+
+  if (v >= 0){
+    // white → pale red (255,170,170)
+    const t=v;
+    const r=255, g=lerp(255,170,t), b=lerp(255,170,t);
+    return "FF" + hex(r) + hex(g) + hex(b);
+  } else {
+    // white → pale blue (170,200,255)
+    const t=-v;
+    const r=lerp(255,170,t), g=lerp(255,200,t), b=255;
+    return "FF" + hex(r) + hex(g) + hex(b);
+  }
+}
+
+/* ---------- main ---------- */
 async function run(){
   try{
     const fileInput = document.getElementById('htmlFile');
     const file = fileInput.files && fileInput.files[0];
-    if(!file){
-      fileInput.click();
-      document.getElementById('log').textContent = "Pick a saved QuantMage HTML first.";
-      return;
-    }
+    if(!file){ fileInput.click(); document.getElementById('log').textContent = "Pick a saved QuantMage HTML first."; return; }
     document.getElementById('log').textContent = "Parsing HTML…";
 
     const html = await file.text();
@@ -152,7 +171,7 @@ async function run(){
 
     const wb = new ExcelJS.Workbook();
 
-    // Metrics
+    /* ---- Metrics ---- */
     const ws1 = wb.addWorksheet('Metrics', {views:[{state:'frozen', ySplit:1}]});
     const dataRows = rowsRaw.map(r => headers.map(h => r[h]));
     ws1.addTable({
@@ -180,7 +199,7 @@ async function run(){
       if (colIndex['Since']) ws1.getCell(r, colIndex['Since']).numFmt = 'yyyy-mm-dd';
     }
 
-    // Correlations
+    /* ---- Correlations (with heatmap) ---- */
     const ws2 = wb.addWorksheet('Correlations', {views:[{state:'frozen', xSplit:1, ySplit:1}]});
     const header2 = ['Name', ...names];
     const corrRows = [];
@@ -205,7 +224,13 @@ async function run(){
     for(let c=2; c<=names.length+1; c++){
       ws2.getColumn(c).width = 7;
       for(let r=2; r<=corrRows.length+1; r++){
-        ws2.getCell(r,c).numFmt = '0.00';
+        const cell = ws2.getCell(r,c);
+        cell.numFmt = '0.00';
+        const val = (typeof cell.value === 'object' && cell.value && 'result' in cell.value) ? cell.value.result : cell.value;
+        const argb = corrToARGB(val);
+        if (argb){
+          cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb } };
+        }
       }
     }
 
@@ -225,7 +250,7 @@ async function run(){
   }
 }
 
-// be extra safe: hook both events
+// basic UI hooks
 const fileEl = document.getElementById('htmlFile');
 fileEl.addEventListener('change', () => { document.getElementById('log').textContent = fileEl.files.length ? fileEl.files[0].name : ""; });
 fileEl.addEventListener('input',  () => { document.getElementById('log').textContent = fileEl.files.length ? fileEl.files[0].name : ""; });
