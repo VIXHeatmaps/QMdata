@@ -19,7 +19,7 @@
   <p class="muted">
     Choose a saved QuantMage HTML (either $ or % view). This creates a formatted <b>.xlsx</b> with
     a <b>Metrics</b> sheet (Gain, CAGR, MD, WinRate, Volatility, Cumulative Return in %) and a
-    <b>Correlations</b> sheet (with a diverging heatmap). Columns empty for every row are omitted. Everything runs locally.
+    minimalist <b>Correlations</b> sheet (only heatmap colors on data cells). Everything runs locally.
   </p>
   <div class="box">
     <div class="row">
@@ -171,7 +171,7 @@ async function run(){
 
     const wb = new ExcelJS.Workbook();
 
-    /* ---- Metrics ---- */
+    /* ---- Metrics (keep table & stripes) ---- */
     const ws1 = wb.addWorksheet('Metrics', {views:[{state:'frozen', ySplit:1}]});
     const dataRows = rowsRaw.map(r => headers.map(h => r[h]));
     ws1.addTable({
@@ -199,37 +199,50 @@ async function run(){
       if (colIndex['Since']) ws1.getCell(r, colIndex['Since']).numFmt = 'yyyy-mm-dd';
     }
 
-    /* ---- Correlations (with heatmap) ---- */
+    /* ---- Correlations (NO table; neutral header/labels; heatmap only on data) ---- */
     const ws2 = wb.addWorksheet('Correlations', {views:[{state:'frozen', xSplit:1, ySplit:1}]});
     const header2 = ['Name', ...names];
-    const corrRows = [];
+    ws2.addRow(header2);
+    const lightHeader = 'FFF2F2F2';   // neutral light gray for header row
+    const lightLabel  = 'FFF7F7F7';   // neutral very light gray for first column
+
+    // style header row
+    const headerRow2 = ws2.getRow(1);
+    headerRow2.font = { bold: true };
+    for (let c=1; c<=header2.length; c++){
+      ws2.getCell(1,c).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: lightHeader } };
+    }
+
+    // build data rows
     for(let i=0;i<names.length;i++){
       const row = [names[i]];
       for(let j=0;j<names.length;j++){
         let v = (i===j) ? 1 : corrForMaps(returnsMaps[names[i]], returnsMaps[names[j]]);
         row.push((v==null || !isFinite(v)) ? null : v);
       }
-      corrRows.push(row);
+      ws2.addRow(row);
     }
-    ws2.addTable({
-      name: 'CorrTable',
-      ref: 'A1',
-      headerRow: true,
-      columns: header2.map(h => ({name: h})),
-      rows: corrRows,
-      style: { theme: 'TableStyleMedium2', showRowStripes: true, showColumnStripes: true }
-    });
-    ws2.getRow(1).font = { bold: true };
+
+    // widths
     ws2.getColumn(1).width = 48;
-    for(let c=2; c<=names.length+1; c++){
-      ws2.getColumn(c).width = 7;
-      for(let r=2; r<=corrRows.length+1; r++){
+    for(let c=2; c<=names.length+1; c++){ ws2.getColumn(c).width = 7; }
+
+    // first column neutral fill
+    for(let r=2; r<=names.length+1; r++){
+      ws2.getCell(r,1).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: lightLabel } };
+    }
+
+    // apply number format + heatmap only to data cells
+    for(let r=2; r<=names.length+1; r++){
+      for(let c=2; c<=names.length+1; c++){
         const cell = ws2.getCell(r,c);
         cell.numFmt = '0.00';
         const val = (typeof cell.value === 'object' && cell.value && 'result' in cell.value) ? cell.value.result : cell.value;
         const argb = corrToARGB(val);
         if (argb){
           cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb } };
+        } else {
+          cell.fill = undefined; // keep it plain if null/non-finite
         }
       }
     }
