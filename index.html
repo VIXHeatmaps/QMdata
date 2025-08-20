@@ -238,7 +238,6 @@ async function run(){
     const base = "https://quantmage.app/grimoire/";
     const rows = [];
     const returnsMaps = {};
-    const names = [];
 
     for (const [sid, payload] of Object.entries(trading_spells)){
       const name = (payload.name || "").trim();
@@ -290,7 +289,7 @@ async function run(){
       const vol_d = stdev(rets), vol_a = vol_d * Math.sqrt(252);
       const mean_d= rets.length ? rets.reduce((a,b)=>a+b,0)/rets.length : null;
 
-      // Daily Sortino: negatives-only denominator, annualized √252
+      // Daily Sortino (negatives-only denominator), annualized √252
       const neg   = rets.filter(r => r < 0);
       const ddev  = (neg.length ? Math.sqrt(neg.reduce((s,r)=>s + r*r, 0) / neg.length) : null);
       const sharpe= (vol_d>0 && mean_d!=null) ? (mean_d/vol_d)*Math.sqrt(252) : null;
@@ -320,7 +319,6 @@ async function run(){
       let mwr = null;
       const irr = xirr(cfAmts, cfDates);
       if (isFinite(irr)){
-        const years  = Math.max((dts[dts.length-1]-dts[0])/(1000*60*60*24)/365.25, 1/365.25);
         mwr = Math.pow(1+irr, years) - 1;
       }
 
@@ -351,13 +349,12 @@ async function run(){
         const a = x[i-1], b = x[i];
         if (a>0 && b>0) m[toDateISO(dts[i])] = b/a - 1;
       }
-      returnsMaps[name] = m;
-      names.push(name);
+      if (Object.keys(m).length) returnsMaps[name] = m;
     }
 
     if (!rows.length){ alert("No rows parsed. Double-check the HTML is a saved QuantMage page."); return; }
 
-    // Sort output by Column A (Name), A–Z
+    // Sort Metrics output by Column A (Name), A–Z
     rows.sort((a,b)=> (a.Name||'').localeCompare(b.Name||''));
 
     // Keep non-empty columns (always keep core + flow flags)
@@ -404,23 +401,26 @@ async function run(){
       money.forEach(h => { if(colIndex[h]) ws1.getCell(r, colIndex[h]).numFmt = '$#,##0.00'; });
     }
 
-    /* ---- Correlations (rolled-back heatmap) ---- */
+    /* ---- Correlations (restored heatmap; alphabetized) ---- */
+    const names = Object.keys(returnsMaps).sort((a,b)=>a.localeCompare(b));
     const ws2 = wb.addWorksheet('Correlations', {views:[{state:'frozen', xSplit:1, ySplit:1}]});
-    const header2 = ['Name', ...names]; ws2.addRow(header2);
-    const lightHeader = 'FFF2F2F2', labelA1='FFF7F7F7', labelA2='FFFBFBFB', borderClr='FFE6E6E6';
 
+    // Header row: Name + sorted names
+    const header2 = ['Name', ...names];
+    ws2.addRow(header2);
+
+    // Header neutral gray
     ws2.getRow(1).font = { bold: true };
     for (let c=1; c<=header2.length; c++){
-      ws2.getCell(1,c).fill = { type:'pattern', pattern:'solid', fgColor:{argb: lightHeader} };
+      ws2.getCell(1,c).fill = { type:'pattern', pattern:'solid', fgColor:{argb: HEADER_GRAY} };
     }
     ws2.getColumn(1).width = 48;
     for(let c=2; c<=names.length+1; c++) ws2.getColumn(c).width = 7;
 
-    for(let r=2; r<=names.length+1; r++){
-      const argb = (r%2===0) ? labelA1 : labelA2;
-      ws2.getCell(r,1).fill = { type:'pattern', pattern:'solid', fgColor:{argb} };
-    }
+    // First column neutral (light alternating) + borders
+    const labelA1='FFF7F7F7', labelA2='FFFBFBFB', borderClr='FFE6E6E6';
 
+    // Add rows with correlations, in the same alphabetic order
     for(let i=0;i<names.length;i++){
       const row=[names[i]];
       for(let j=0;j<names.length;j++){
@@ -430,6 +430,10 @@ async function run(){
       ws2.addRow(row);
     }
 
+    // Style first column and paint heatmap
+    for(let r=2; r<=names.length+1; r++){
+      ws2.getCell(r,1).fill = { type:'pattern', pattern:'solid', fgColor:{argb: (r%2===0)?labelA1:labelA2} };
+    }
     for(let r=1; r<=names.length+1; r++){
       for(let c=1; c<=names.length+1; c++){
         const cell = ws2.getCell(r,c);
@@ -437,8 +441,8 @@ async function run(){
                         bottom:{style:'thin',color:{argb:borderClr}}, right:{style:'thin',color:{argb:borderClr}} };
         if (r>=2 && c>=2){
           cell.numFmt = '0.00';
-          const v = (typeof cell.value==='object' && cell.value && 'result' in cell.value) ? cell.value.result : cell.value;
-          const argb = corrToARGB(v);
+          const v = cell.value;
+          const argb = corrToARGB(typeof v==='number'? v : (v && v.result));
           if (argb) cell.fill = { type:'pattern', pattern:'solid', fgColor:{argb} };
         }
       }
