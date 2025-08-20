@@ -18,13 +18,14 @@
   <h1>QuantMage → Excel Exporter</h1>
   <p class="muted">
     Choose a saved QuantMage HTML (either $ or % view). This creates a formatted <b>.xlsx</b> with
-    a <b>Metrics</b> sheet (Gain, CAGR, MD, WinRate, Volatility, Cumulative Return in %, currency for CurrentValue) and a
-    minimalist <b>Correlations</b> sheet (neutral headers/labels, thin borders, heatmap only on data). Everything runs locally.
+    a <b>Metrics</b> sheet (alternating green banding, $ for CurrentValue) and a minimalist
+    <b>Correlations</b> sheet (neutral headers/labels, thin borders, heatmap only on data).
+    Everything runs locally.
   </p>
   <div class="box">
     <div class="row">
       <label><b>Saved HTML:</b> <input type="file" id="htmlFile" accept=".html,.htm"></label>
-      <button id="runBtn">Export → <code>QM_export.xlsx</code></button>
+      <button id="runBtn">Export → <code>QM_export_YYYY-MM-DD.xlsx</code></button>
     </div>
     <div id="log" class="muted" style="margin-top:8px;"></div>
   </div>
@@ -45,6 +46,10 @@ function stdev(arr){ if(arr.length<2) return 0; const m=arr.reduce((a,b)=>a+b,0)
 function maxDrawdown(values){ let peak=values[0], mdd=0; const dd=[]; for(const v of values){ peak=Math.max(peak,v); const d=v/peak-1; mdd=Math.min(mdd,d); dd.push(-d);} return {mdd, dd}; }
 function ulcerIndex(dd){ if(!dd.length) return NaN; const ms=dd.reduce((s,x)=>s+x*x,0)/dd.length; return Math.sqrt(ms); }
 function toDateISO(d){ const z=n=>String(n).padStart(2,'0'); return `${d.getFullYear()}-${z(d.getMonth()+1)}-${z(d.getDate())}`; }
+function todayStamp(){
+  const d=new Date(), z=n=>String(n).padStart(2,'0');
+  return `${d.getFullYear()}-${z(d.getMonth()+1)}-${z(d.getDate())}`;
+}
 
 /* correlation with overlap, return null for non-finite */
 function corrForMaps(mapA, mapB){
@@ -163,7 +168,7 @@ async function run(){
       returnsMaps[name] = m;
     }
 
-    // drop all-empty columns (always keep Name & URL)
+    // Keep non-empty columns (always keep Name & URL)
     const allCols = Object.keys(rowsRaw[0] || {});
     const headers = allCols.filter(c => {
       if (c==="Name"||c==="URL") return true;
@@ -172,14 +177,14 @@ async function run(){
 
     const wb = new ExcelJS.Workbook();
 
-    /* ---- Metrics (no table; light-green banding; $ format for CurrentValue) ---- */
+    /* ---- Metrics: alternating green banding + currency ---- */
     const ws1 = wb.addWorksheet('Metrics', {views:[{state:'frozen', ySplit:1}]});
     ws1.addRow(headers).font = { bold: true };
 
     const dataRows = rowsRaw.map(r => headers.map(h => r[h]));
     dataRows.forEach(row => ws1.addRow(row));
 
-    // widths
+    // column widths
     headers.forEach((h, i) => {
       const col = ws1.getColumn(i+1);
       if (h==='Name') col.width = 48;
@@ -188,7 +193,7 @@ async function run(){
       else col.width = 14;
     });
 
-    // formats
+    // number formats
     const pctCols = ['Gain','CAGR','MD','WinRate','Volatility','CumulativeReturn'];
     const twoDecCols = ['Sharpe','Sortino','MAR','UPI','GPR'];
     const colIndex = Object.fromEntries(headers.map((h,i)=>[h,i+1]));
@@ -199,31 +204,32 @@ async function run(){
       if (colIndex['CurrentValue']) ws1.getCell(r, colIndex['CurrentValue']).numFmt = '$#,##0.00';
     }
 
-    // light green banding (data rows only)
-    const green1 = 'FFF7FBF7'; // very light green
-    const green2 = 'FFEFF7EF'; // slightly deeper light green
+    // alternating green banding (very subtle)
+    const g1 = 'FFF6FBF6'; // light green A
+    const g2 = 'FFEDF7ED'; // light green B
     for (let r=2; r<=ws1.rowCount; r++){
-      const fill = (r % 2 === 0) ? { type:'pattern', pattern:'solid', fgColor:{argb: green1} }
-                                 : { type:'pattern', pattern:'solid', fgColor:{argb: green2} };
+      const fill = (r % 2 === 0)
+        ? { type:'pattern', pattern:'solid', fgColor:{argb: g1} }
+        : { type:'pattern', pattern:'solid', fgColor:{argb: g2} };
       for (let c=1; c<=headers.length; c++){ ws1.getCell(r,c).fill = fill; }
     }
 
-    /* ---- Correlations (no table; neutral labels; thin borders; heatmap on data) ---- */
+    /* ---- Correlations (unchanged: neutral labels, thin borders, heatmap) ---- */
     const ws2 = wb.addWorksheet('Correlations', {views:[{state:'frozen', xSplit:1, ySplit:1}]});
     const header2 = ['Name', ...names];
     ws2.addRow(header2);
-    const lightHeader = 'FFF2F2F2';   // header row
-    const labelA1     = 'FFF7F7F7';   // column A band 1
-    const labelA2     = 'FFFBFBFB';   // column A band 2
-    const borderClr   = 'FFE6E6E6';   // thin neutral borders
+    const lightHeader = 'FFF2F2F2';
+    const labelA1     = 'FFF7F7F7';
+    const labelA2     = 'FFFBFBFB';
+    const borderClr   = 'FFE6E6E6';
 
-    // style header row
+    // header styling
     ws2.getRow(1).font = { bold: true };
     for (let c=1; c<=header2.length; c++){
       ws2.getCell(1,c).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: lightHeader } };
     }
 
-    // add rows
+    // rows + correlations
     for(let i=0;i<names.length;i++){
       const row = [names[i]];
       for(let j=0;j<names.length;j++){
@@ -237,24 +243,22 @@ async function run(){
     ws2.getColumn(1).width = 48;
     for(let c=2; c<=names.length+1; c++){ ws2.getColumn(c).width = 7; }
 
-    // alternating neutral fills for column A (names)
+    // column A alternating fill
     for(let r=2; r<=names.length+1; r++){
       const argb = (r % 2 === 0) ? labelA1 : labelA2;
       ws2.getCell(r,1).fill = { type:'pattern', pattern:'solid', fgColor:{argb} };
     }
 
-    // number format, heatmap, and thin borders everywhere
+    // number format + heatmap + borders
     for(let r=1; r<=names.length+1; r++){
       for(let c=1; c<=names.length+1; c++){
         const cell = ws2.getCell(r,c);
-        // borders (very light)
         cell.border = {
           top:    { style:'thin', color:{argb: borderClr} },
           left:   { style:'thin', color:{argb: borderClr} },
           bottom: { style:'thin', color:{argb: borderClr} },
           right:  { style:'thin', color:{argb: borderClr} }
         };
-        // data cells only (B2:…): format + heatmap
         if (r>=2 && c>=2){
           cell.numFmt = '0.00';
           const val = (typeof cell.value === 'object' && cell.value && 'result' in cell.value) ? cell.value.result : cell.value;
@@ -264,15 +268,15 @@ async function run(){
       }
     }
 
-    // Download
+    // Download with date suffix
     const buf = await wb.xlsx.writeBuffer();
     const blob = new Blob([buf], {type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'});
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob);
-    a.download = 'QM_export.xlsx';
+    a.download = `QM_export_${todayStamp()}.xlsx`;
     a.click();
     setTimeout(()=>URL.revokeObjectURL(a.href), 3000);
-    document.getElementById('log').textContent = "Done. Downloaded QM_export.xlsx";
+    document.getElementById('log').textContent = `Done. Downloaded QM_export_${todayStamp()}.xlsx`;
   } catch (err){
     console.error(err);
     document.getElementById('log').textContent = "Error: " + (err && err.message ? err.message : err);
