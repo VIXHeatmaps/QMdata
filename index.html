@@ -35,21 +35,23 @@
 
 <script>
 /* ===== Config =====
-   Use a neutral table style, then paint a mint header (no row banding).
+   Neutral table style; mint header; alternating white & very-light-mint row banding.
 */
-const METRICS_TABLE_STYLE = 'TableStyleLight1';   // neutral; we style header ourselves
+const METRICS_TABLE_STYLE = 'TableStyleLight1';   // neutral; we style ourselves
 
-// Magic-mint (https://en.wikipedia.org/wiki/Spring_green#Magic_mint)
-const MINT_HEADER = 'FFAAF0D1'; // #AAF0D1
+// Magic-mint family
+const MINT_HEADER = 'FFAAF0D1';  // header: Magic Mint (#AAF0D1)
+const MINT_BAND   = 'FFEFFFFB';  // very light mint for bands (#EFFFFB)
+const WHITE_FILL  = 'FFFFFFFF';
 
 /* ---------- helpers ---------- */
 const RE_CONST = name => new RegExp(`const\\s+${name}\\s*=\\s*(".*?");`, 's');
 function parseDoubleJSON(jsStringLiteral){ const inner = JSON.parse(jsStringLiteral); return JSON.parse(inner); }
-function ymdToDate(i){ const s=String(i); return new Date(+s.slice(0,4), +s.slice(4,6)-1, +s.slice(6,8)); }
+function ymdToDate(i){ const s=String(i); return new Date(+s.slice(0,4), +s.slice(4,6)-1, +s.slice(8,10)); } // fixed day slice
 function inferDates(vals, datesList, lastValueDate){
   const n=vals.length;
-  if(Array.isArray(datesList)&&datesList.length>=n){ return datesList.slice(-n).map(ymdToDate); }
-  const end=(typeof lastValueDate==='number')? ymdToDate(lastValueDate) : new Date();
+  if(Array.isArray(datesList)&&datesList.length>=n){ return datesList.slice(-n).map(d=>new Date(String(d).slice(0,4), String(d).slice(4,6)-1, String(d).slice(6,8))); }
+  const end=(typeof lastValueDate==='number')? new Date(String(lastValueDate).slice(0,4), String(lastValueDate).slice(4,6)-1, String(lastValueDate).slice(6,8)) : new Date();
   const out=[]; for(let i=0;i<n;i++){ const d=new Date(end); d.setDate(d.getDate()-(n-1-i)); out.push(d);} return out;
 }
 function pctReturns(values){ const out=[]; for(let i=1;i<values.length;i++){ const a=values[i-1], b=values[i]; if(a>0) out.push(b/a-1);} return out; }
@@ -61,7 +63,8 @@ function todayStamp(){ const d=new Date(), z=n=>String(n).padStart(2,'0'); retur
 
 /* correlation with overlap, return null for non-finite */
 function corrForMaps(mapA, mapB){
-  const keys = Object.keys(mapA).length < Object.keys(mapB).length ? Object.keys(mapA) : Object.keys(mapB);
+  const aKeys = Object.keys(mapA), bKeys = Object.keys(mapB);
+  const keys = aKeys.length < bKeys.length ? aKeys : bKeys;
   let xs=[], ys=[];
   for(const k of keys){ if(mapA[k]!==undefined && mapB[k]!==undefined){ xs.push(mapA[k]); ys.push(mapB[k]); } }
   if(xs.length < 2) return null;
@@ -168,7 +171,7 @@ async function run(){
 
     const wb = new ExcelJS.Workbook();
 
-    /* ---- Metrics: neutral table + mint header ---- */
+    /* ---- Metrics: mint header + alternating white/mint bands ---- */
     const ws1 = wb.addWorksheet('Metrics', {views:[{state:'frozen', ySplit:1}]});
     const metricsRows = rowsRaw.map(r => headers.map(h => r[h]));
     ws1.addTable({
@@ -180,13 +183,13 @@ async function run(){
       style: { theme: METRICS_TABLE_STYLE, showRowStripes: false, showColumnStripes: false }
     });
 
-    // Header styling
+    // Header styling (mint)
     ws1.getRow(1).font = { bold: true };
     for (let c=1; c<=headers.length; c++){
       ws1.getCell(1,c).fill = { type:'pattern', pattern:'solid', fgColor:{argb: MINT_HEADER} };
     }
 
-    // widths
+    // Column widths
     headers.forEach((h, i) => {
       const col = ws1.getColumn(i+1);
       if (h==='Name') col.width = 48;
@@ -195,7 +198,7 @@ async function run(){
       else col.width = 14;
     });
 
-    // formats (apply to data region)
+    // Number formats
     const pctCols = ['Gain','CAGR','MD','WinRate','Volatility','CumulativeReturn'];
     const twoDecCols = ['Sharpe','Sortino','MAR','UPI','GPR'];
     const colIndex = Object.fromEntries(headers.map((h,i)=>[h,i+1]));
@@ -204,6 +207,16 @@ async function run(){
       twoDecCols.forEach(h => { if(colIndex[h]) ws1.getCell(r, colIndex[h]).numFmt = '0.00'; });
       if (colIndex['Since']) ws1.getCell(r, colIndex['Since']).numFmt = 'yyyy-mm-dd';
       if (colIndex['CurrentValue']) ws1.getCell(r, colIndex['CurrentValue']).numFmt = '$#,##0.00';
+    }
+
+    // Alternating bands: white / very light mint
+    for (let r=2; r<=metricsRows.length+1; r++){
+      const fill = (r % 2 === 0)
+        ? { type:'pattern', pattern:'solid', fgColor:{argb: MINT_BAND} }
+        : { type:'pattern', pattern:'solid', fgColor:{argb: WHITE_FILL} };
+      for (let c=1; c<=headers.length; c++){
+        ws1.getCell(r,c).fill = fill;
+      }
     }
 
     /* ---- Correlations (neutral labels, thin borders, heatmap only) ---- */
