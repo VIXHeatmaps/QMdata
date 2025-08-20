@@ -23,7 +23,7 @@
   <h1>QuantMage → Excel Exporter</h1>
   <p class="muted">
     Choose a saved QuantMage HTML ($ or % view). Outputs a formatted <b>.xlsx</b> with
-    a <b>Metrics</b> sheet (TWR &amp; MWR side-by-side), a <b>Correlations</b> sheet, and a <b>Formulas</b> sheet. Everything runs locally.
+    a <b>Metrics</b> sheet (<i>Cumulative Return (TWR)</i> &amp; <i>All Time (MWR)</i>), a <b>Correlations</b> sheet, and a <b>Formulas</b> sheet. Everything runs locally.
   </p>
   <div class="box">
     <div class="row">
@@ -35,7 +35,7 @@
 
 <script>
 /* ===== Colors ===== */
-const MINT_HEADER = 'FFAAF0D1';
+const HEADER_GRAY = 'FFF2F2F2';
 
 /* ===== Regex & helpers ===== */
 const RE_CONST = name => new RegExp(`const\\s+${name}\\s*=\\s*(".*?");`, 's');
@@ -63,7 +63,7 @@ function stdev(arr){ if(arr.length<2) return 0; const m=arr.reduce((a,b)=>a+b,0)
 function maxDrawdown(values){ let peak=values[0], mdd=0, dd=[]; for(const v of values){ peak=Math.max(peak,v); const d=v/peak-1; mdd=Math.min(mdd,d); dd.push(-d);} return {mdd, dd}; }
 function ulcerIndex(dd){ if(!dd.length) return NaN; const ms=dd.reduce((s,x)=>s+x*x,0)/dd.length; return Math.sqrt(ms); }
 
-/* --- Flow helpers --- */
+/* --- Flows helpers --- */
 function toYMDIntLocal(d){ return d.getFullYear()*10000 + (d.getMonth()+1)*100 + d.getDate(); }
 function ymdIntToISO(n){
   if(n==null || !isFinite(n)) return '';
@@ -72,7 +72,7 @@ function ymdIntToISO(n){
   return `${y}-${String(m).padStart(2,'0')}-${String(d).padStart(2,'0')}`;
 }
 
-// Robust unitization: at each flow, choose multiply/divide so the boundary jump is ~0.
+// Robust unitization: choose multiply/divide at each flow to remove the jump.
 function unitizeByCashFlows(values, dates, cashFlows){
   const n = values.length;
   if (!cashFlows || !cashFlows.length || n===0) return values.slice();
@@ -81,7 +81,6 @@ function unitizeByCashFlows(values, dates, cashFlows){
     .filter(f=>f && isFinite(f.date) && isFinite(f.ratio) && f.ratio>0)
     .sort((a,b)=>a.date - b.date);
 
-  // find first index k where date >= flow.date
   const kList = flows.map(f => {
     const target = f.date;
     let k = 0;
@@ -110,7 +109,11 @@ function unitizeByCashFlows(values, dates, cashFlows){
   return out;
 }
 
-/* Reconstruct dollar flows for MWR (IRR) */
+/* Reconstruct dollar flows for MWR (IRR) using adjustment ratio r:
+   r is the post-flow adjustment applied to LATER values to remove the jump.
+   For a flow at boundary with pre-flow Vprev, contribution C satisfies:
+   r = Vprev / (Vprev + C)  →  C = Vprev*(1/r - 1). (Withdrawal will yield negative C.)
+   Investor cash flow sign: contribution = negative, withdrawal = positive. */
 function reconstructFlows(vals, dts, cashFlows, anchorIdx){
   const flows = [];
   const n = vals.length;
@@ -121,59 +124,41 @@ function reconstructFlows(vals, dts, cashFlows, anchorIdx){
     .sort((a,b)=>a.date - b.date);
 
   for (const f of sorted){
-    // index k is first date >= flow.date
+    // first index k where date >= flow.date
     let k = anchorIdx;
     while (k < n && toYMDIntLocal(dts[k]) < f.date) k++;
-    if (k <= anchorIdx || k >= n) continue; // ignore flows at/ before anchor or after end
+    if (k <= anchorIdx || k >= n) continue;
 
     const prevIdx = Math.max(k-1, anchorIdx);
     const Vprev = vals[prevIdx];
     if (!(Vprev>0)) continue;
 
-    // Interpret ratio as V_after = V_prev * r  → cashflow amount = V_prev*(r-1)
-    const amount = Vprev * (Number(f.ratio) - 1);
-
-    // From investor perspective: contribution = negative, withdrawal = positive
-    const signed = -amount;
+    const r = Number(f.ratio);
+    const amount = Vprev * (1/r - 1); // <-- FIXED
+    const signed = -amount;           // contribution negative, withdrawal positive
     flows.push({date: ymdToDate(f.date), cf: signed});
   }
   return flows;
 }
 
-/* XIRR via bracketing + bisection (robust) */
+/* XIRR via bracketing + bisection */
 function xirr(cashflows, dates){
   if (!cashflows.length || cashflows.length !== dates.length) return null;
-  // time exponents in years from first date
   const t0 = dates[0].getTime();
   const exps = dates.map(d => (d.getTime() - t0) / (1000*60*60*24*365.25));
-
   const f = (r)=>{
     if (r <= -0.999999) return Number.POSITIVE_INFINITY;
-    let s = 0;
-    for (let i=0;i<cashflows.length;i++){
-      s += cashflows[i] / Math.pow(1+r, exps[i]);
-    }
+    let s = 0; for (let i=0;i<cashflows.length;i++){ s += cashflows[i] / Math.pow(1+r, exps[i]); }
     return s;
   };
-
-  // bracket
-  let lo = -0.9999, hi = 1.0;
-  let flo = f(lo), fhi = f(hi);
-  let iter = 0;
-  while (flo*fhi > 0 && hi < 1000 && iter++ < 60){
-    hi *= 2;
-    fhi = f(hi);
-  }
+  let lo = -0.9999, hi = 1.0, flo = f(lo), fhi = f(hi), iter=0;
+  while (flo*fhi > 0 && hi < 1000 && iter++ < 60){ hi *= 2; fhi = f(hi); }
   if (flo*fhi > 0) return null;
-
-  // bisection
   for (let i=0;i<100;i++){
-    const mid = (lo+hi)/2;
-    const fm = f(mid);
+    const mid = (lo+hi)/2, fm = f(mid);
     if (!isFinite(fm)) { hi = mid; continue; }
     if (Math.abs(fm) < 1e-9) return mid;
-    if (flo*fm <= 0){ hi = mid; fhi = fm; }
-    else { lo = mid; flo = fm; }
+    if (flo*fm <= 0){ hi = mid; fhi = fm; } else { lo = mid; flo = fm; }
   }
   return (lo+hi)/2;
 }
@@ -189,20 +174,16 @@ function extractSinceMapFromHTML(fullHTML){
       const nameIdx = ths.findIndex(h => /name/i.test(h));
       const sinceIdx= ths.findIndex(h => /since/i.test(h));
       if (nameIdx === -1 || sinceIdx === -1) continue;
-
       const rows = Array.from(t.querySelectorAll('tbody tr')).length
         ? Array.from(t.querySelectorAll('tbody tr'))
         : Array.from(t.querySelectorAll('tr')).slice(1);
-
       for (const tr of rows){
         const tds = Array.from(tr.querySelectorAll('td'));
         if (!tds.length) continue;
         const name = (tds[nameIdx]?.textContent || '').trim();
         const sinceRaw = (tds[sinceIdx]?.textContent || '').trim();
         const m = sinceRaw.match(/(\d{4})[\/\-.](\d{1,2})[\/\-.](\d{1,2})/);
-        if (name && m){
-          map[name] = `${m[1]}-${String(m[2]).padStart(2,'0')}-${String(m[3]).padStart(2,'0')}`;
-        }
+        if (name && m){ map[name] = `${m[1]}-${String(m[2]).padStart(2,'0')}-${String(m[3]).padStart(2,'0')}`; }
       }
     }
   }catch(e){ /* ignore */ }
@@ -210,18 +191,10 @@ function extractSinceMapFromHTML(fullHTML){
 }
 
 /* Correlations */
-function corrToARGB(v){
-  if (v==null || !isFinite(v)) return null;
-  v = Math.max(-1, Math.min(1, v));
-  const lerp=(a,b,t)=>Math.round(a+(b-a)*t), hex=n=>n.toString(16).padStart(2,'0').toUpperCase();
-  if (v >= 0){ const t=v; return "FF"+hex(255)+hex(lerp(255,170,t))+hex(lerp(255,170,t)); }
-  const t=-v; return "FF"+hex(lerp(255,170,t))+hex(lerp(255,200,t))+hex(255);
-}
 function corrForMaps(mapA, mapB){
   const aKeys = Object.keys(mapA), bKeys = Object.keys(mapB);
   const keys = aKeys.length < bKeys.length ? aKeys : bKeys;
-  let xs=[], ys=[];
-  for(const k of keys){ if(mapA[k]!==undefined && mapB[k]!==undefined){ xs.push(mapA[k]); ys.push(mapB[k]); } }
+  let xs=[], ys=[]; for(const k of keys){ if(mapA[k]!==undefined && mapB[k]!==undefined){ xs.push(mapA[k]); ys.push(mapB[k]); } }
   if(xs.length < 2) return null;
   const mean = a => a.reduce((p,c)=>p+c,0)/a.length; const mx=mean(xs), my=mean(ys);
   let num=0, denx=0, deny=0;
@@ -287,7 +260,7 @@ async function run(){
       const dts = dtsFull.slice(anchor);
       if (x.length < 2) continue;
 
-      // TWR (cumulative since anchor)
+      // Cumulative Return (TWR)
       let twr = null;
       if (x[0] > 0) twr = x[x.length-1]/x[0] - 1;
 
@@ -307,22 +280,25 @@ async function run(){
       const vol_d = stdev(rets), vol_a = vol_d * Math.sqrt(252);
       const mean_d= rets.length ? rets.reduce((a,b)=>a+b,0)/rets.length : null;
 
-      // Sortino: downside deviation from negatives only (to match site)
+      // Sharpe/Sortino
       const neg   = rets.filter(r => r < 0);
       const ddev  = (neg.length ? Math.sqrt(neg.reduce((s,r)=>s + r*r, 0) / neg.length) : null);
       const sharpe= (vol_d>0 && mean_d!=null) ? (mean_d/vol_d)*Math.sqrt(252) : null;
       const sort  = (ddev>0 && mean_d!=null) ? (mean_d/ddev)*Math.sqrt(252) : null;
 
+      // GPR: Gain-to-Pain Ratio (sum of gains / |sum of losses|)
+      const sumPos = rets.reduce((s,r)=> s + (r>0 ? r : 0), 0);
+      const sumNeg = Math.abs(rets.reduce((s,r)=> s + (r<0 ? r : 0), 0));
+      const gpr    = sumNeg>0 ? (sumPos / sumNeg) : null;
+
       const mar   = (mdd<0 && cagr!=null) ? (cagr/Math.abs(mdd)) : null;
       const win   = rets.length ? rets.filter(r=>r>0).length/rets.length : null;
 
-      // ---- MWR (cumulative) via XIRR on dollar flows since anchor ----
-      // Build cashflows: initial (-V_anchor), each contribution/withdrawal, terminal (+V_last)
+      // ---- All Time (MWR) via XIRR on dollar flows since anchor ----
       const anchorVal = vals[anchor];
       const endVal    = vals[vals.length-1];
       const cfDates = [dts[0]];
       const cfAmts  = [ -anchorVal ];
-
       const dollarFlows = reconstructFlows(vals, dtsFull, td.cash_flow_history, anchor);
       for (const f of dollarFlows){
         if (f.date >= dts[0] && f.date <= dtsFull[dtsFull.length-1]){
@@ -334,26 +310,26 @@ async function run(){
       let mwr = null;
       const irr = xirr(cfAmts, cfDates);
       if (isFinite(irr)){
-        mwr = Math.pow(1+irr, years) - 1; // convert annual IRR to cumulative over the same period
+        mwr = Math.pow(1+irr, years) - 1; // annual IRR → cumulative over period
       }
 
       rows.push({
         Name: name,
         URL: base+sid,
-        CurrentValue: endVal,                       // raw value
+        CurrentValue: endVal,                 // raw value ($ view)
         Since: toDateISO(dts[0]),
         HasFlows: (Array.isArray(td.cash_flow_history) && td.cash_flow_history.length>0) ? 'Yes' : 'No',
         FlowCount: Array.isArray(td.cash_flow_history) ? td.cash_flow_history.length : 0,
         LastFlow: (Array.isArray(td.cash_flow_history) && td.cash_flow_history.length>0) ? ymdIntToISO(td.cash_flow_history[td.cash_flow_history.length-1].date) : '' ,
-        TWR: twr,                                   // time-weighted (flow-neutral) cumulative return
-        MWR: (mwr!=null && isFinite(mwr)) ? mwr : null, // money-weighted (IRR) cumulative return
+        "Cumulative Return (TWR)": twr,
+        "All Time (MWR)": (mwr!=null && isFinite(mwr)) ? mwr : null,
         CAGR: cagr,
         MD: Math.abs(mdd),
         Sharpe: isFinite(sharpe)?sharpe:null,
         Sortino: isFinite(sort)?sort:null,
         MAR: isFinite(mar)?mar:null,
         UPI: isFinite(upi)?upi:null,
-        GPR: null,
+        GPR: isFinite(gpr)?gpr:null,
         WinRate: isFinite(win)?win:null,
         Volatility: isFinite(vol_a)?vol_a:null
       });
@@ -376,7 +352,7 @@ async function run(){
 
     // Keep non-empty columns (always keep core + flow flags)
     const allCols = Object.keys(rows[0]);
-    const must = new Set(['Name','URL','Since','HasFlows','FlowCount','LastFlow','TWR','MWR']);
+    const must = new Set(['Name','URL','Since','HasFlows','FlowCount','LastFlow','Cumulative Return (TWR)','All Time (MWR)']);
     const headers = allCols.filter(c=>{
       if (must.has(c)) return true;
       return rows.some(r => r[c] !== "" && r[c] !== null && r[c] !== undefined && !(typeof r[c]==="number" && isNaN(r[c])));
@@ -385,7 +361,7 @@ async function run(){
     /* ===== Build workbook ===== */
     const wb = new ExcelJS.Workbook();
 
-    // ---- Metrics (built-in banding so stripes stay after sorts) ----
+    // ---- Metrics (built-in gray banding; stable after sorts) ----
     const ws1 = wb.addWorksheet('Metrics', {views:[{state:'frozen', ySplit:1}]});
     const metricsRows = rows.map(r => headers.map(h => r[h]));
     ws1.addTable({
@@ -397,10 +373,10 @@ async function run(){
       style: { theme: 'TableStyleLight1', showRowStripes: true, showColumnStripes: false }
     });
 
-    // Header style (mint)
+    // Gray header fill
     ws1.getRow(1).font = { bold: true };
     for (let c=1; c<=headers.length; c++){
-      ws1.getCell(1,c).fill = { type:'pattern', pattern:'solid', fgColor:{argb: MINT_HEADER} };
+      ws1.getCell(1,c).fill = { type:'pattern', pattern:'solid', fgColor:{argb: HEADER_GRAY} };
     }
 
     // Column widths
@@ -409,11 +385,11 @@ async function run(){
       if (h==='Name') col.width = 48;
       else if (h==='URL') col.width = 42;
       else if (h==='Since') col.width = 12;
-      else col.width = 14;
+      else col.width = 16;
     });
 
     // Number formats
-    const pctCols = ['TWR','MWR','CAGR','MD','WinRate','Volatility'];
+    const pctCols = ['Cumulative Return (TWR)','All Time (MWR)','CAGR','MD','WinRate','Volatility'];
     const twoDec  = ['Sharpe','Sortino','MAR','UPI','GPR'];
     const money   = ['CurrentValue'];
     const colIndex= Object.fromEntries(headers.map((h,i)=>[h,i+1]));
@@ -427,11 +403,9 @@ async function run(){
     // ---- Correlations ----
     const ws2 = wb.addWorksheet('Correlations', {views:[{state:'frozen', xSplit:1, ySplit:1}]});
     const header2 = ['Name', ...names]; ws2.addRow(header2);
-    const lightHeader = 'FFF2F2F2', labelA1='FFF7F7F7', labelA2='FFFBFBFB', borderClr='FFE6E6E6';
-
     ws2.getRow(1).font = { bold: true };
     for (let c=1; c<=header2.length; c++){
-      ws2.getCell(1,c).fill = { type:'pattern', pattern:'solid', fgColor:{argb: lightHeader} };
+      ws2.getCell(1,c).fill = { type:'pattern', pattern:'solid', fgColor:{argb: HEADER_GRAY} };
     }
     for(let i=0;i<names.length;i++){
       const row=[names[i]];
@@ -441,46 +415,28 @@ async function run(){
       }
       ws2.addRow(row);
     }
-    ws2.getColumn(1).width = 48;
-    for(let c=2; c<=names.length+1; c++) ws2.getColumn(c).width = 7;
-
-    for(let r=2; r<=names.length+1; r++){
-      const argb = (r%2===0) ? labelA1 : labelA2;
-      ws2.getCell(r,1).fill = { type:'pattern', pattern:'solid', fgColor:{argb} };
-    }
-    for(let r=1; r<=names.length+1; r++){
-      for(let c=1; c<=names.length+1; c++){
-        const cell = ws2.getCell(r,c);
-        cell.border = { top:{style:'thin',color:{argb:borderClr}}, left:{style:'thin',color:{argb:borderClr}},
-                        bottom:{style:'thin',color:{argb:borderClr}}, right:{style:'thin',color:{argb:borderClr}} };
-        if (r>=2 && c>=2){
-          cell.numFmt = '0.00';
-          const v = (typeof cell.value==='object' && cell.value && 'result' in cell.value) ? cell.value.result : cell.value;
-          const argb = (v==null)? null : (v>=0 ? "FFF5E6E6" : "FFE6ECFF"); // light tint
-          if (argb) cell.fill = { type:'pattern', pattern:'solid', fgColor:{argb} };
-        }
-      }
-    }
+    ws2.getColumn(1).width = 48; for(let c=2; c<=names.length+1; c++) ws2.getColumn(c).width = 7;
 
     // ---- Formulas (transparent definitions) ----
     const ws3 = wb.addWorksheet('Formulas');
     const defs = [
       ['Column','Definition'],
-      ['TWR','Time-weighted cumulative return since "Since": let U be the unitized series removing cash-flow jumps; TWR = U_last / U_first - 1.'],
-      ['MWR','Money-weighted cumulative return since "Since": compute XIRR r from cash flows (initial = -V_since, each flow amount = -V_prev*(ratio-1), terminal = +V_last), then MWR = (1+r)^{years} - 1.'],
-      ['CAGR','Annualized TWR: (U_last/U_first)^{1/years} - 1.'],
-      ['MD','Max drawdown of U: max over t of (1 - U_t / max_{s<=t} U_s).'],
-      ['Sharpe','√252 * mean(daily_returns_of_U) / stdev(daily_returns_of_U).'],
-      ['Sortino','√252 * mean(daily_returns_of_U) / sqrt(mean(neg^2)), neg = min(0, daily_return).'],
+      ['Cumulative Return (TWR)','Time-weighted cumulative return since "Since": let U be the unitized series (cash-flows removed); TWR = U_last / U_first − 1.'],
+      ['All Time (MWR)','Money-weighted cumulative return since "Since": build cash flows with initial −V_since, each flow amount = −V_prev*(1/r − 1), terminal +V_last; compute XIRR r and set MWR = (1+r)^{years} − 1.'],
+      ['CAGR','Annualized TWR: (U_last/U_first)^{1/years} − 1.'],
+      ['MD','Max drawdown of U: max_t (1 − U_t / max_{s≤t} U_s).'],
+      ['Sharpe','√252 · mean(daily_returns(U)) / stdev(daily_returns(U)).'],
+      ['Sortino','√252 · mean(daily_returns(U)) / sqrt(mean(neg^2)), neg = {r<0 ? r : 0}.'],
       ['MAR','CAGR / |MD|.'],
       ['UPI','CAGR / UlcerIndex, UlcerIndex = sqrt(mean(drawdown^2)).'],
-      ['WinRate','Fraction of days where daily_return > 0 on U.'],
-      ['Volatility','Annualized stdev: stdev(daily_returns_of_U) * √252.'],
-      ['CurrentValue','Unadjusted last value from value_history.'],
-      ['HasFlows / FlowCount / LastFlow','Flags derived from trading_data.cash_flow_history.'],
+      ['GPR','Gain-to-Pain = sum(max(r,0)) / |sum(min(r,0))| on daily_returns(U).'],
+      ['WinRate','share of days with r > 0 on U.'],
+      ['Volatility','stdev(daily_returns(U)) · √252.'],
+      ['CurrentValue','Unadjusted last value from value_history (matches $ view).'],
+      ['HasFlows / FlowCount / LastFlow','Derived from trading_data.cash_flow_history.'],
     ];
     ws3.addRows(defs);
-    ws3.columns = [{width:22},{width:120}];
+    ws3.columns = [{width:26},{width:120}];
     ws3.getRow(1).font = { bold: true };
 
     // ---- Download (date-stamped) ----
