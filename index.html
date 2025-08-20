@@ -5,7 +5,7 @@
   <title>QuantMage → Excel Exporter</title>
   <meta name="viewport" content="width=device-width, initial-scale=1">
 
-  <!-- Favicon: mint tile with “QM” -->
+  <!-- Favicon -->
   <link rel="icon" type="image/svg+xml"
         href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect rx='12' width='64' height='64' fill='%23121a24'/%3E%3Crect x='6' y='6' width='52' height='52' rx='10' fill='%23AAF0D1'/%3E%3Ctext x='32' y='41' font-family='Arial, Helvetica, sans-serif' font-size='28' text-anchor='middle' fill='%23121a24' font-weight='700'%3EQM%3C/text%3E%3C/svg%3E">
 
@@ -22,26 +22,24 @@
 <body>
   <h1>QuantMage → Excel Exporter</h1>
   <p class="muted">
-    Choose a saved QuantMage HTML ($ or % view). Outputs a formatted <b>.xlsx</b> file with
-    a <b>Metrics</b> sheet and <b>Correlations</b> heatmap. (Excludes empty columns.) Everything runs locally.
+    Choose a saved QuantMage HTML ($ or % view). Outputs a formatted <b>.xlsx</b> with
+    a <b>Metrics</b> sheet (Gain anchored to the page’s <i>Since</i> date) and a <b>Correlations</b> sheet. Everything runs locally.
   </p>
   <div class="box">
     <div class="row">
       <label><b>Saved HTML:</b> <input type="file" id="htmlFile" accept=".html,.htm"></label>
-      <!-- Static label only; the real download name includes today’s date -->
       <button id="runBtn">Export → <code>QM_export.xlsx</code></button>
     </div>
     <div id="log" class="muted" style="margin-top:8px;"></div>
   </div>
 
 <script>
-/* ===== Styling config ===== */
-const METRICS_TABLE_STYLE = 'TableStyleLight1'; // neutral; we style header/banding ourselves
-const MINT_HEADER = 'FFAAF0D1';  // header: Magic Mint (#AAF0D1)
-const MINT_BAND   = 'FFDFF7F3';  // very light mint for alternating rows (#DFF7F3)
+/* ===== Colors ===== */
+const MINT_HEADER = 'FFAAF0D1';
+const MINT_BAND   = 'FFDFF7F3';
 const WHITE_FILL  = 'FFFFFFFF';
 
-/* ===== Helper funcs ===== */
+/* ===== Regex & helpers ===== */
 const RE_CONST = name => new RegExp(`const\\s+${name}\\s*=\\s*(".*?");`, 's');
 function parseDoubleJSON(jsStringLiteral){ const inner = JSON.parse(jsStringLiteral); return JSON.parse(inner); }
 
@@ -63,46 +61,44 @@ function inferDates(vals, datesList, lastValueDate){
   const out=[]; for(let i=0;i<n;i++){ const d=new Date(end); d.setDate(d.getDate()-(n-1-i)); out.push(d);} return out;
 }
 
-/* Stats */
 function stdev(arr){ if(arr.length<2) return 0; const m=arr.reduce((a,b)=>a+b,0)/arr.length; const v=arr.reduce((s,x)=>s+(x-m)*(x-m),0)/arr.length; return Math.sqrt(v); }
 function maxDrawdown(values){ let peak=values[0], mdd=0, dd=[]; for(const v of values){ peak=Math.max(peak,v); const d=v/peak-1; mdd=Math.min(mdd,d); dd.push(-d);} return {mdd, dd}; }
 function ulcerIndex(dd){ if(!dd.length) return NaN; const ms=dd.reduce((s,x)=>s+x*x,0)/dd.length; return Math.sqrt(ms); }
 
-/* ===== Anchor finder (prevents seed / rescaling jumps) =====
-   - Start at first >0 value
-   - Walk forward until the step return |r| <= 50% and prev>0
-   - Also sanity check vs the median of the next ~12 values (prev should not be a tiny seed)
-*/
-function findStableAnchor(vals, startIdx=0){
-  const n = vals.length;
-  let i = Math.max(0, startIdx);
-  // helper median
-  const median = a => {
-    if (!a.length) return NaN;
-    const s=[...a].sort((x,y)=>x-y);
-    const m=Math.floor(s.length/2);
-    return s.length%2?s[m]:(s[m-1]+s[m])/2;
-  };
+/* Parse the rendered table to map Name → Since Date (YYYY-MM-DD) */
+function extractSinceMapFromHTML(fullHTML){
+  const map = {};
+  try{
+    const dom = new DOMParser().parseFromString(fullHTML, 'text/html');
+    const tables = Array.from(dom.querySelectorAll('table'));
+    for (const t of tables){
+      const ths = Array.from(t.querySelectorAll('thead th, tr th')).map(th=>th.textContent.trim());
+      const nameIdx = ths.findIndex(h => /name/i.test(h));
+      const sinceIdx= ths.findIndex(h => /since/i.test(h));
+      if (nameIdx === -1 || sinceIdx === -1) continue;
 
-  // move to first strictly positive
-  while (i<n && !(vals[i]>0)) i++;
-  if (i>=n-1) return i;
+      const rows = Array.from(t.querySelectorAll('tbody tr')).length
+        ? Array.from(t.querySelectorAll('tbody tr'))
+        : Array.from(t.querySelectorAll('tr')).slice(1);
 
-  while (i < n-1){
-    const a = vals[i], b = vals[i+1];
-    if (!(a>0 && b>0)){ i++; continue; }
-    const r = b/a - 1;
-    if (Math.abs(r) > 0.50){ i++; continue; }                 // skip absurd first step
-    const look = [];
-    for (let k=i; k<Math.min(n, i+14); k++){ if (vals[k]>0) look.push(vals[k]); }
-    const med = median(look);
-    if (isFinite(med) && a < 0.6*med){ i++; continue; }       // skip tiny seed vs neighborhood
-    break;
-  }
-  return i;
+      for (const tr of rows){
+        const tds = Array.from(tr.querySelectorAll('td'));
+        if (!tds.length) continue;
+        const name = (tds[nameIdx]?.textContent || '').trim();
+        const sinceRaw = (tds[sinceIdx]?.textContent || '').trim();
+        // Accept 2024/10/07 or 2024-10-07
+        const m = sinceRaw.match(/(\d{4})[\/\-](\d{2})[\/\-](\d{2})/);
+        if (name && m){
+          const iso = `${m[1]}-${m[2]}-${m[3]}`;
+          map[name] = iso;
+        }
+      }
+    }
+  }catch(e){ /* ignore */ }
+  return map; // may be empty
 }
 
-/* Correlation color: 0→white, +1→pale red, −1→pale blue */
+/* Correlations */
 function corrToARGB(v){
   if (v==null || !isFinite(v)) return null;
   v = Math.max(-1, Math.min(1, v));
@@ -110,8 +106,6 @@ function corrToARGB(v){
   if (v >= 0){ const t=v; return "FF"+hex(255)+hex(lerp(255,170,t))+hex(lerp(255,170,t)); }
   const t=-v; return "FF"+hex(lerp(255,170,t))+hex(lerp(255,200,t))+hex(255);
 }
-
-/* Overlap correlation on date-keyed return maps */
 function corrForMaps(mapA, mapB){
   const aKeys = Object.keys(mapA), bKeys = Object.keys(mapB);
   const keys = aKeys.length < bKeys.length ? aKeys : bKeys;
@@ -135,12 +129,17 @@ async function run(){
 
     const html = await file.text();
 
+    // 1) decode trading_spells data
     const mTS = RE_CONST('trading_spells').exec(html);
     if(!mTS){ alert('Could not find "const trading_spells" in the HTML'); return; }
     const trading_spells = parseDoubleJSON(mTS[1]);
 
+    // 2) optional dates[] for alignment
     const mDates = RE_CONST('dates').exec(html);
     const dates_list = mDates ? parseDoubleJSON(mDates[1]) : null;
+
+    // 3) extract Since dates from the rendered table
+    const sinceByName = extractSinceMapFromHTML(html);
 
     const base = "https://quantmage.app/grimoire/";
     const rows = [];
@@ -153,71 +152,76 @@ async function run(){
       const vals = Array.isArray(td.value_history) ? td.value_history.map(Number) : [];
       if (vals.length < 3) continue;
 
-      // Align dates
       const dtsFull = inferDates(vals, dates_list, td.last_value_date);
 
-      // Find a stable anchor (skips seed/warm-up)
-      const anchor = findStableAnchor(vals, 0);
-      if (anchor >= vals.length-2) continue;
+      // Find anchor:
+      let anchor = 0;
+      if (sinceByName[name]){
+        // Align to the first index with date >= Since
+        const sinceDate = new Date(sinceByName[name] + "T00:00:00");
+        anchor = dtsFull.findIndex(d => d >= sinceDate);
+        if (anchor < 0) anchor = 0;
+      } else {
+        // Fallback: first strictly positive value that doesn't create absurd return
+        let i=0; while (i<vals.length && !(vals[i]>0)) i++;
+        while (i < vals.length-1){
+          const a=vals[i], b=vals[i+1];
+          if (a>0 && b>0 && Math.abs(b/a-1) <= 0.50) break;
+          i++;
+        }
+        anchor = Math.min(i, vals.length-2);
+      }
 
       const x   = vals.slice(anchor);
       const dts = dtsFull.slice(anchor);
+      if (x.length < 2) continue;
 
-      // Daily arithmetic returns from stable region (guard against nonpositive)
+      // Gain ONLY: last / first - 1
+      let gain = null;
+      if (x[0] > 0) gain = x[x.length-1]/x[0] - 1;
+
+      // Minimal other fields just to keep sheet usable
       const rets = [];
       for (let i=1; i<x.length; i++){
         const a = x[i-1], b = x[i];
-        if (a>0 && b>0){
-          rets.push(b/a - 1);
-        }
+        if (a>0 && b>0) rets.push(b/a - 1);
       }
-      if (rets.length < 2) continue;
-
-      // Metrics (calendar-day span; annualize via √252)
       const days   = Math.max((dts[dts.length-1] - dts[0])/(1000*60*60*24), 1);
       const years  = days/365.25;
       const growth = x[x.length-1] / x[0];
-      const cagr   = years>0 ? Math.pow(growth, 1/years) - 1 : NaN;
-
+      const cagr   = (years>0 && growth>0) ? Math.pow(growth, 1/years) - 1 : null;
       const {mdd, dd} = maxDrawdown(x);
-      const ui    = ulcerIndex(dd);
-      const upi   = ui>0 ? (cagr/ui) : NaN;
-
-      const vol_d = stdev(rets);
-      const vol_a = vol_d * Math.sqrt(252);
-      const mean_d= rets.reduce((a,b)=>a+b,0)/rets.length;
-      const sharpe= vol_d>0 ? (mean_d/vol_d)*Math.sqrt(252) : NaN;
-
+      const ui = ulcerIndex(dd);
+      const upi   = ui>0 && cagr!=null ? (cagr/ui) : null;
+      const vol_d = stdev(rets), vol_a = vol_d * Math.sqrt(252);
+      const mean_d= rets.length ? rets.reduce((a,b)=>a+b,0)/rets.length : null;
+      const sharpe= (vol_d>0 && mean_d!=null) ? (mean_d/vol_d)*Math.sqrt(252) : null;
       const neg   = rets.filter(r=>r<0);
-      const sort  = neg.length ? (mean_d / stdev(neg)) * Math.sqrt(252) : null;
-
-      const win   = rets.filter(r=>r>0).length / rets.length;
-      const gains = rets.filter(r=>r>0).reduce((a,b)=>a+b,0);
-      const loss  = rets.filter(r=>r<0).reduce((a,b)=>a+b,0);
-      const gpr   = loss < 0 ? (gains/Math.abs(loss)) : null;
-      const mar   = mdd < 0 ? (cagr/Math.abs(mdd)) : null;
+      const sort  = (neg.length && mean_d!=null) ? (mean_d/stdev(neg))*Math.sqrt(252) : null;
+      const mar   = (mdd<0 && cagr!=null) ? (cagr/Math.abs(mdd)) : null;
+      const win   = rets.length ? rets.filter(r=>r>0).length/rets.length : null;
 
       rows.push({
         Name: name,
         URL: base+sid,
         CurrentValue: x[x.length-1],
-        Gain: growth-1,                             // %
+        Gain: gain,                                  // ← anchored to table’s Since
         Since: toDateISO(dts[0]),
-        CAGR: cagr,                                 // %
-        MD: Math.abs(mdd),                          // %
+        CAGR: cagr,
+        MD: Math.abs(mdd),
         Sharpe: isFinite(sharpe)?sharpe:null,
         Sortino: isFinite(sort)?sort:null,
         MAR: isFinite(mar)?mar:null,
         UPI: isFinite(upi)?upi:null,
-        GPR: isFinite(gpr)?gpr:null,
-        WinRate: win,                               // %
-        Volatility: vol_a,                          // %
-        CumulativeReturn: growth-1                  // %
+        GPR: null,
+        WinRate: isFinite(win)?win:null,
+        Volatility: isFinite(vol_a)?vol_a:null,
+        CumulativeReturn: gain
       });
 
       names.push(name);
 
-      // For correlations (overlapping dates)
+      // For correlations
       const m = {};
       for (let i=1; i<x.length; i++){
         const a = x[i-1], b = x[i];
@@ -228,10 +232,18 @@ async function run(){
 
     if (!rows.length){ alert("No rows parsed. Double-check the HTML is a saved QuantMage page."); return; }
 
-    // Keep non-empty columns (always keep Name/URL)
+    // Sort by Gain desc (missing values treated as -∞)
+    rows.sort((a,b)=>{
+      const ga = (typeof a.Gain === 'number') ? a.Gain : -Infinity;
+      const gb = (typeof b.Gain === 'number') ? b.Gain : -Infinity;
+      return gb - ga;
+    });
+
+    // Keep non-empty columns (always keep Name/URL/Gain/Since)
     const allCols = Object.keys(rows[0]);
+    const must = new Set(['Name','URL','Gain','Since']);
     const headers = allCols.filter(c=>{
-      if (c==="Name"||c==="URL") return true;
+      if (must.has(c)) return true;
       return rows.some(r => r[c] !== "" && r[c] !== null && r[c] !== undefined && !(typeof r[c]==="number" && isNaN(r[c])));
     });
 
@@ -247,7 +259,7 @@ async function run(){
       headerRow: true,
       columns: headers.map(h => ({name: h})),
       rows: metricsRows,
-      style: { theme: METRICS_TABLE_STYLE, showRowStripes: false, showColumnStripes: false }
+      style: { theme: 'TableStyleLight1', showRowStripes: false, showColumnStripes: false }
     });
 
     // Header style
@@ -266,12 +278,12 @@ async function run(){
     });
 
     // Number formats
-    const pctCols   = ['Gain','CAGR','MD','WinRate','Volatility','CumulativeReturn'];
-    const twoDec    = ['Sharpe','Sortino','MAR','UPI','GPR'];
-    const colIndex  = Object.fromEntries(headers.map((h,i)=>[h,i+1]));
+    const pctCols = ['Gain','CAGR','MD','WinRate','Volatility','CumulativeReturn'];
+    const twoDec  = ['Sharpe','Sortino','MAR','UPI','GPR'];
+    const colIndex= Object.fromEntries(headers.map((h,i)=>[h,i+1]));
     for (let r=2; r<=metricsRows.length+1; r++){
       pctCols.forEach(h => { if(colIndex[h]) ws1.getCell(r, colIndex[h]).numFmt = '0.00%'; });
-      twoDec.forEach(h => { if(colIndex[h]) ws1.getCell(r, colIndex[h]).numFmt = '0.00'; });
+      twoDec.forEach(h  => { if(colIndex[h]) ws1.getCell(r, colIndex[h]).numFmt = '0.00'; });
       if (colIndex['Since']) ws1.getCell(r, colIndex['Since']).numFmt = 'yyyy-mm-dd';
       if (colIndex['CurrentValue']) ws1.getCell(r, colIndex['CurrentValue']).numFmt = '$#,##0.00';
     }
