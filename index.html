@@ -18,12 +18,12 @@
   <h1>QuantMage → Excel Exporter</h1>
   <p class="muted">
     Choose a saved QuantMage HTML ($ or % view). Outputs a formatted <b>.xlsx</b> file with
-    a <b>Metrics</b> sheet and a <b>Correlations</b> heatmap sheet. Everything runs locally.
+    a <b>Metrics</b> sheet and <b>Correlations</b> heatmap. (Excludes empty columns.) Everything runs locally.
   </p>
   <div class="box">
     <div class="row">
       <label><b>Saved HTML:</b> <input type="file" id="htmlFile" accept=".html,.htm"></label>
-      <button id="runBtn">Export → <code>QM_export.xlsx</code></button>
+      <button id="runBtn">Export → <code>.xlsx</code></button>
     </div>
     <div id="log" class="muted" style="margin-top:8px;"></div>
   </div>
