@@ -17,20 +17,24 @@
 <body>
   <h1>QuantMage → Excel Exporter</h1>
   <p class="muted">
-    Choose a saved QuantMage HTML (either $ or % view). This creates a formatted <b>.xlsx</b> with
-    a <b>Metrics</b> sheet (alternating green banding, $ for CurrentValue) and a minimalist
-    <b>Correlations</b> sheet (neutral headers/labels, thin borders, heatmap only on data).
-    Everything runs locally.
+    Choose a saved QuantMage HTML ($ or % view). Outputs a formatted <b>.xlsx</b> file with
+    a <b>Metrics</b> sheet and a <b>Correlations</b> heatmap sheet. Everything runs locally.
   </p>
   <div class="box">
     <div class="row">
       <label><b>Saved HTML:</b> <input type="file" id="htmlFile" accept=".html,.htm"></label>
-      <button id="runBtn">Export → <code>QM_export_YYYY-MM-DD.xlsx</code></button>
+      <button id="runBtn">Export → <code>QM_export.xlsx</code></button>
     </div>
     <div id="log" class="muted" style="margin-top:8px;"></div>
   </div>
 
 <script>
+/* ===== Config: pick the Metrics table color =====
+   Green (this build):  'TableStyleMedium4'
+   Old Blue (fallback): 'TableStyleMedium9'
+*/
+const METRICS_TABLE_STYLE = 'TableStyleMedium4';
+
 /* ---------- helpers ---------- */
 const RE_CONST = name => new RegExp(`const\\s+${name}\\s*=\\s*(".*?");`, 's');
 function parseDoubleJSON(jsStringLiteral){ const inner = JSON.parse(jsStringLiteral); return JSON.parse(inner); }
@@ -46,10 +50,7 @@ function stdev(arr){ if(arr.length<2) return 0; const m=arr.reduce((a,b)=>a+b,0)
 function maxDrawdown(values){ let peak=values[0], mdd=0; const dd=[]; for(const v of values){ peak=Math.max(peak,v); const d=v/peak-1; mdd=Math.min(mdd,d); dd.push(-d);} return {mdd, dd}; }
 function ulcerIndex(dd){ if(!dd.length) return NaN; const ms=dd.reduce((s,x)=>s+x*x,0)/dd.length; return Math.sqrt(ms); }
 function toDateISO(d){ const z=n=>String(n).padStart(2,'0'); return `${d.getFullYear()}-${z(d.getMonth()+1)}-${z(d.getDate())}`; }
-function todayStamp(){
-  const d=new Date(), z=n=>String(n).padStart(2,'0');
-  return `${d.getFullYear()}-${z(d.getMonth()+1)}-${z(d.getDate())}`;
-}
+function todayStamp(){ const d=new Date(), z=n=>String(n).padStart(2,'0'); return `${d.getFullYear()}-${z(d.getMonth()+1)}-${z(d.getDate())}`; }
 
 /* correlation with overlap, return null for non-finite */
 function corrForMaps(mapA, mapB){
@@ -57,37 +58,20 @@ function corrForMaps(mapA, mapB){
   let xs=[], ys=[];
   for(const k of keys){ if(mapA[k]!==undefined && mapB[k]!==undefined){ xs.push(mapA[k]); ys.push(mapB[k]); } }
   if(xs.length < 2) return null;
-  const mean = a => a.reduce((p,c)=>p+c,0)/a.length;
-  const mx=mean(xs), my=mean(ys);
+  const mean = a => a.reduce((p,c)=>p+c,0)/a.length; const mx=mean(xs), my=mean(ys);
   let num=0, denx=0, deny=0;
   for(let i=0;i<xs.length;i++){ const dx=xs[i]-mx, dy=ys[i]-my; num+=dx*dy; denx+=dx*dx; deny+=dy*dy; }
-  const den = Math.sqrt(denx*deny);
-  if(den<=0) return null;
-  let r = num/den;
-  if(!isFinite(r)) return null;
-  if(r>1) r=1; if(r<-1) r=-1;
-  return r;
+  const den = Math.sqrt(denx*deny); if(den<=0) return null;
+  let r = num/den; if(!isFinite(r)) return null; if(r>1) r=1; if(r<-1) r=-1; return r;
 }
 
 /* color mapping: 0→white; +1→pale red; −1→pale blue */
 function corrToARGB(v){
   if (v==null || !isFinite(v)) return null;
-  const clamp = x => Math.max(-1, Math.min(1, x));
-  v = clamp(v);
-  const lerp = (a,b,t)=>Math.round(a+(b-a)*t);
-  const hex = n => n.toString(16).padStart(2,'0').toUpperCase();
-
-  if (v >= 0){
-    // white → pale red (255,170,170)
-    const t=v;
-    const r=255, g=lerp(255,170,t), b=lerp(255,170,t);
-    return "FF" + hex(r) + hex(g) + hex(b);
-  } else {
-    // white → pale blue (170,200,255)
-    const t=-v;
-    const r=lerp(255,170,t), g=lerp(255,200,t), b=255;
-    return "FF" + hex(r) + hex(g) + hex(b);
-  }
+  const clamp = x => Math.max(-1, Math.min(1, x)); v = clamp(v);
+  const lerp = (a,b,t)=>Math.round(a+(b-a)*t); const hex = n => n.toString(16).padStart(2,'0').toUpperCase();
+  if (v >= 0){ const t=v; const r=255, g=lerp(255,170,t), b=lerp(255,170,t); return "FF"+hex(r)+hex(g)+hex(b); }
+  const t=-v; const r=lerp(255,170,t), g=lerp(255,200,t), b=255; return "FF"+hex(r)+hex(g)+hex(b);
 }
 
 /* ---------- main ---------- */
@@ -168,7 +152,7 @@ async function run(){
       returnsMaps[name] = m;
     }
 
-    // Keep non-empty columns (always keep Name & URL)
+    // keep non-empty columns (always keep Name & URL)
     const allCols = Object.keys(rowsRaw[0] || {});
     const headers = allCols.filter(c => {
       if (c==="Name"||c==="URL") return true;
@@ -177,14 +161,20 @@ async function run(){
 
     const wb = new ExcelJS.Workbook();
 
-    /* ---- Metrics: alternating green banding + currency ---- */
+    /* ---- Metrics: TABLE with banding (green by default) ---- */
     const ws1 = wb.addWorksheet('Metrics', {views:[{state:'frozen', ySplit:1}]});
-    ws1.addRow(headers).font = { bold: true };
+    const metricsRows = rowsRaw.map(r => headers.map(h => r[h]));
+    ws1.addTable({
+      name: 'MetricsTable',
+      ref: 'A1',
+      headerRow: true,
+      columns: headers.map(h => ({name: h})),
+      rows: metricsRows,
+      style: { theme: METRICS_TABLE_STYLE, showRowStripes: true, showColumnStripes: false }
+    });
+    ws1.getRow(1).font = { bold: true };
 
-    const dataRows = rowsRaw.map(r => headers.map(h => r[h]));
-    dataRows.forEach(row => ws1.addRow(row));
-
-    // column widths
+    // widths
     headers.forEach((h, i) => {
       const col = ws1.getColumn(i+1);
       if (h==='Name') col.width = 48;
@@ -193,28 +183,18 @@ async function run(){
       else col.width = 14;
     });
 
-    // number formats
+    // formats (apply to data region)
     const pctCols = ['Gain','CAGR','MD','WinRate','Volatility','CumulativeReturn'];
     const twoDecCols = ['Sharpe','Sortino','MAR','UPI','GPR'];
     const colIndex = Object.fromEntries(headers.map((h,i)=>[h,i+1]));
-    for (let r=2; r<=ws1.rowCount; r++){
+    for (let r=2; r<=metricsRows.length+1; r++){
       pctCols.forEach(h => { if(colIndex[h]) ws1.getCell(r, colIndex[h]).numFmt = '0.00%'; });
       twoDecCols.forEach(h => { if(colIndex[h]) ws1.getCell(r, colIndex[h]).numFmt = '0.00'; });
       if (colIndex['Since']) ws1.getCell(r, colIndex['Since']).numFmt = 'yyyy-mm-dd';
       if (colIndex['CurrentValue']) ws1.getCell(r, colIndex['CurrentValue']).numFmt = '$#,##0.00';
     }
 
-    // alternating green banding (very subtle)
-    const g1 = 'FFF6FBF6'; // light green A
-    const g2 = 'FFEDF7ED'; // light green B
-    for (let r=2; r<=ws1.rowCount; r++){
-      const fill = (r % 2 === 0)
-        ? { type:'pattern', pattern:'solid', fgColor:{argb: g1} }
-        : { type:'pattern', pattern:'solid', fgColor:{argb: g2} };
-      for (let c=1; c<=headers.length; c++){ ws1.getCell(r,c).fill = fill; }
-    }
-
-    /* ---- Correlations (unchanged: neutral labels, thin borders, heatmap) ---- */
+    /* ---- Correlations (neutral labels, thin borders, heatmap only) ---- */
     const ws2 = wb.addWorksheet('Correlations', {views:[{state:'frozen', xSplit:1, ySplit:1}]});
     const header2 = ['Name', ...names];
     ws2.addRow(header2);
@@ -223,13 +203,10 @@ async function run(){
     const labelA2     = 'FFFBFBFB';
     const borderClr   = 'FFE6E6E6';
 
-    // header styling
     ws2.getRow(1).font = { bold: true };
     for (let c=1; c<=header2.length; c++){
       ws2.getCell(1,c).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: lightHeader } };
     }
-
-    // rows + correlations
     for(let i=0;i<names.length;i++){
       const row = [names[i]];
       for(let j=0;j<names.length;j++){
@@ -238,18 +215,13 @@ async function run(){
       }
       ws2.addRow(row);
     }
-
-    // widths
     ws2.getColumn(1).width = 48;
     for(let c=2; c<=names.length+1; c++){ ws2.getColumn(c).width = 7; }
 
-    // column A alternating fill
     for(let r=2; r<=names.length+1; r++){
       const argb = (r % 2 === 0) ? labelA1 : labelA2;
       ws2.getCell(r,1).fill = { type:'pattern', pattern:'solid', fgColor:{argb} };
     }
-
-    // number format + heatmap + borders
     for(let r=1; r<=names.length+1; r++){
       for(let c=1; c<=names.length+1; c++){
         const cell = ws2.getCell(r,c);
