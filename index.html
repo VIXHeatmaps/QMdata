@@ -18,8 +18,8 @@
   <h1>QuantMage → Excel Exporter</h1>
   <p class="muted">
     Choose a saved QuantMage HTML (either $ or % view). This creates a formatted <b>.xlsx</b> with
-    a <b>Metrics</b> sheet (Gain, CAGR, MD, WinRate, Volatility, Cumulative Return in %) and a
-    minimalist <b>Correlations</b> sheet (only heatmap colors on data cells). Everything runs locally.
+    a <b>Metrics</b> sheet (Gain, CAGR, MD, WinRate, Volatility, Cumulative Return in %, currency for CurrentValue) and a
+    minimalist <b>Correlations</b> sheet (neutral headers/labels, thin borders, heatmap only on data). Everything runs locally.
   </p>
   <div class="box">
     <div class="row">
@@ -163,6 +163,7 @@ async function run(){
       returnsMaps[name] = m;
     }
 
+    // drop all-empty columns (always keep Name & URL)
     const allCols = Object.keys(rowsRaw[0] || {});
     const headers = allCols.filter(c => {
       if (c==="Name"||c==="URL") return true;
@@ -171,18 +172,14 @@ async function run(){
 
     const wb = new ExcelJS.Workbook();
 
-    /* ---- Metrics (keep table & stripes) ---- */
+    /* ---- Metrics (no table; light-green banding; $ format for CurrentValue) ---- */
     const ws1 = wb.addWorksheet('Metrics', {views:[{state:'frozen', ySplit:1}]});
+    ws1.addRow(headers).font = { bold: true };
+
     const dataRows = rowsRaw.map(r => headers.map(h => r[h]));
-    ws1.addTable({
-      name: 'MetricsTable',
-      ref: 'A1',
-      headerRow: true,
-      columns: headers.map(h => ({name: h})),
-      rows: dataRows,
-      style: { theme: 'TableStyleMedium9', showRowStripes: true }
-    });
-    ws1.getRow(1).font = { bold: true };
+    dataRows.forEach(row => ws1.addRow(row));
+
+    // widths
     headers.forEach((h, i) => {
       const col = ws1.getColumn(i+1);
       if (h==='Name') col.width = 48;
@@ -190,30 +187,43 @@ async function run(){
       else if (h==='Since') col.width = 12;
       else col.width = 14;
     });
+
+    // formats
     const pctCols = ['Gain','CAGR','MD','WinRate','Volatility','CumulativeReturn'];
-    const twoDecCols = ['Sharpe','Sortino','MAR','UPI','GPR','CurrentValue'];
+    const twoDecCols = ['Sharpe','Sortino','MAR','UPI','GPR'];
     const colIndex = Object.fromEntries(headers.map((h,i)=>[h,i+1]));
-    for (let r=2; r<=dataRows.length+1; r++){
+    for (let r=2; r<=ws1.rowCount; r++){
       pctCols.forEach(h => { if(colIndex[h]) ws1.getCell(r, colIndex[h]).numFmt = '0.00%'; });
       twoDecCols.forEach(h => { if(colIndex[h]) ws1.getCell(r, colIndex[h]).numFmt = '0.00'; });
       if (colIndex['Since']) ws1.getCell(r, colIndex['Since']).numFmt = 'yyyy-mm-dd';
+      if (colIndex['CurrentValue']) ws1.getCell(r, colIndex['CurrentValue']).numFmt = '$#,##0.00';
     }
 
-    /* ---- Correlations (NO table; neutral header/labels; heatmap only on data) ---- */
+    // light green banding (data rows only)
+    const green1 = 'FFF7FBF7'; // very light green
+    const green2 = 'FFEFF7EF'; // slightly deeper light green
+    for (let r=2; r<=ws1.rowCount; r++){
+      const fill = (r % 2 === 0) ? { type:'pattern', pattern:'solid', fgColor:{argb: green1} }
+                                 : { type:'pattern', pattern:'solid', fgColor:{argb: green2} };
+      for (let c=1; c<=headers.length; c++){ ws1.getCell(r,c).fill = fill; }
+    }
+
+    /* ---- Correlations (no table; neutral labels; thin borders; heatmap on data) ---- */
     const ws2 = wb.addWorksheet('Correlations', {views:[{state:'frozen', xSplit:1, ySplit:1}]});
     const header2 = ['Name', ...names];
     ws2.addRow(header2);
-    const lightHeader = 'FFF2F2F2';   // neutral light gray for header row
-    const lightLabel  = 'FFF7F7F7';   // neutral very light gray for first column
+    const lightHeader = 'FFF2F2F2';   // header row
+    const labelA1     = 'FFF7F7F7';   // column A band 1
+    const labelA2     = 'FFFBFBFB';   // column A band 2
+    const borderClr   = 'FFE6E6E6';   // thin neutral borders
 
     // style header row
-    const headerRow2 = ws2.getRow(1);
-    headerRow2.font = { bold: true };
+    ws2.getRow(1).font = { bold: true };
     for (let c=1; c<=header2.length; c++){
       ws2.getCell(1,c).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: lightHeader } };
     }
 
-    // build data rows
+    // add rows
     for(let i=0;i<names.length;i++){
       const row = [names[i]];
       for(let j=0;j<names.length;j++){
@@ -227,22 +237,29 @@ async function run(){
     ws2.getColumn(1).width = 48;
     for(let c=2; c<=names.length+1; c++){ ws2.getColumn(c).width = 7; }
 
-    // first column neutral fill
+    // alternating neutral fills for column A (names)
     for(let r=2; r<=names.length+1; r++){
-      ws2.getCell(r,1).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: lightLabel } };
+      const argb = (r % 2 === 0) ? labelA1 : labelA2;
+      ws2.getCell(r,1).fill = { type:'pattern', pattern:'solid', fgColor:{argb} };
     }
 
-    // apply number format + heatmap only to data cells
-    for(let r=2; r<=names.length+1; r++){
-      for(let c=2; c<=names.length+1; c++){
+    // number format, heatmap, and thin borders everywhere
+    for(let r=1; r<=names.length+1; r++){
+      for(let c=1; c<=names.length+1; c++){
         const cell = ws2.getCell(r,c);
-        cell.numFmt = '0.00';
-        const val = (typeof cell.value === 'object' && cell.value && 'result' in cell.value) ? cell.value.result : cell.value;
-        const argb = corrToARGB(val);
-        if (argb){
-          cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb } };
-        } else {
-          cell.fill = undefined; // keep it plain if null/non-finite
+        // borders (very light)
+        cell.border = {
+          top:    { style:'thin', color:{argb: borderClr} },
+          left:   { style:'thin', color:{argb: borderClr} },
+          bottom: { style:'thin', color:{argb: borderClr} },
+          right:  { style:'thin', color:{argb: borderClr} }
+        };
+        // data cells only (B2:…): format + heatmap
+        if (r>=2 && c>=2){
+          cell.numFmt = '0.00';
+          const val = (typeof cell.value === 'object' && cell.value && 'result' in cell.value) ? cell.value.result : cell.value;
+          const argb = corrToARGB(val);
+          if (argb){ cell.fill = { type:'pattern', pattern:'solid', fgColor:{argb} }; }
         }
       }
     }
