@@ -73,27 +73,51 @@ function ymdIntToISO(n){
   const y = Math.trunc(n/10000), m = Math.trunc((n%10000)/100), d = n%100;
   return `${y}-${String(m).padStart(2,'0')}-${String(d).padStart(2,'0')}`;
 }
-// Unitize: make the series continuous across cash-flow dates by multiplying values
-// on/after a flow by the recorded ratio(s). Use unitized series for returns,
-// but keep raw last value for "CurrentValue".
+
+// Robust unitization: for each flow ratio r at index k (first date >= flow.date),
+// choose orientation (multiply or divide) that makes the boundary jump ~ 0.
 function unitizeByCashFlows(values, dates, cashFlows){
-  if (!cashFlows || !cashFlows.length) return values.slice();
-  const flows = cashFlows.slice().filter(f=>f && isFinite(f.date) && isFinite(f.ratio)).sort((a,b)=>a.date - b.date);
-  const out = new Array(values.length);
-  let j = 0, factor = 1;
-  for (let i=0; i<values.length; i++){
-    const ymd = toYMDIntLocal(dates[i]);
-    while (j < flows.length && flows[j].date <= ymd){
-      const r = Number(flows[j].ratio);
-      if (isFinite(r) && r>0) factor *= r;
-      j++;
+  const n = values.length;
+  if (!cashFlows || !cashFlows.length || n===0) return values.slice();
+
+  const flows = cashFlows.slice()
+    .filter(f=>f && isFinite(f.date) && isFinite(f.ratio) && f.ratio>0)
+    .sort((a,b)=>a.date - b.date);
+
+  // Precompute first index k where date >= flow.date
+  const kList = flows.map(f => {
+    const target = f.date;
+    let k = 0;
+    while (k < n && (dates[k].getFullYear()*10000 + (dates[k].getMonth()+1)*100 + dates[k].getDate()) < target) k++;
+    return k;
+  });
+
+  const out = new Array(n);
+  let factor = 1;
+  let nextFlow = 0;
+
+  for (let i=0; i<n; i++){
+    // Apply all flows whose effective index is i
+    while (nextFlow < flows.length && kList[nextFlow] === i){
+      const r = Number(flows[nextFlow].ratio);
+
+      if (i > 0 && isFinite(values[i-1]) && isFinite(values[i]) && values[i-1]>0 && values[i]>0){
+        const prev = values[i-1], curr = values[i];
+        const jumpMul = Math.abs((curr * factor * r) / (prev * factor) - 1); // apply r to later values
+        const jumpDiv = Math.abs((curr * factor / r) / (prev * factor) - 1); // apply 1/r to later values
+        factor = (jumpMul < jumpDiv) ? factor * r : factor / r;
+      }else{
+        // Fallback if we can't compare
+        factor /= r; // default to dividing later values by r
+      }
+      nextFlow++;
     }
-    out[i] = values[i]*factor;
+    out[i] = values[i] * factor;
   }
   return out;
 }
 
-/* Parse the rendered table to map Name → Since (and optionally Gain) */
+/* Parse the rendered table to map Name → Since (and optionally Gain/All Time %) */
 function extractTableMaps(fullHTML){
   const byName = { since:{}, gain:{} };
   try{
@@ -103,7 +127,7 @@ function extractTableMaps(fullHTML){
       const ths = Array.from(t.querySelectorAll('thead th, tr th')).map(th=>th.textContent.trim());
       const nameIdx = ths.findIndex(h => /name/i.test(h));
       const sinceIdx= ths.findIndex(h => /since/i.test(h));
-      const gainIdx = ths.findIndex(h => /^gain$/i.test(h)); // only if the table exposes it
+      const gainIdx = ths.findIndex(h => /^all time$|^gain$/i.test(h)); // support "All Time" or "Gain"
       if (nameIdx === -1) continue;
 
       const rows = Array.from(t.querySelectorAll('tbody tr')).length
@@ -122,9 +146,9 @@ function extractTableMaps(fullHTML){
           if (m){ byName.since[name] = `${m[1]}-${String(m[2]).padStart(2,'0')}-${String(m[3]).padStart(2,'0')}`; }
         }
         if (gainIdx !== -1){
-          // Accept like "15.41%" → 0.1541
-          const g = (tds[gainIdx]?.textContent || '').trim().replace(/[^0-9.\-]/g,'');
-          if (g !== '') byName.gain[name] = Number(g)/100;
+          const gtxt = (tds[gainIdx]?.textContent || '').trim();
+          const g = gtxt.match(/-?\d+(\.\d+)?\s*%/);
+          if (g){ byName.gain[name] = Number(g[0].replace(/[^0-9.\-]/g,''))/100; }
         }
       }
     }
@@ -212,7 +236,7 @@ async function run(){
       const dts = dtsFull.slice(anchor);
       if (x.length < 2) continue;
 
-      // Flow-neutral, since-anchored cumulative return (matches site’s far-right cumulative col)
+      // Flow-neutral, since-anchored cumulative return (site's "All Time" in the table)
       let gain = null;
       if (x[0] > 0) gain = x[x.length-1]/x[0] - 1;
 
@@ -231,18 +255,22 @@ async function run(){
       const upi   = ui>0 && cagr!=null ? (cagr/ui) : null;
       const vol_d = stdev(rets), vol_a = vol_d * Math.sqrt(252);
       const mean_d= rets.length ? rets.reduce((a,b)=>a+b,0)/rets.length : null;
+
+      // Proper Sortino: downside deviation relative to 0, include zeros for positive days
+      const downs = rets.map(r => (r < 0 ? r : 0));
+      const ddev  = Math.sqrt(downs.reduce((s,r)=>s + r*r, 0) / rets.length);
       const sharpe= (vol_d>0 && mean_d!=null) ? (mean_d/vol_d)*Math.sqrt(252) : null;
-      const neg   = rets.filter(r=>r<0);
-      const sort  = (neg.length && mean_d!=null) ? (mean_d/stdev(neg))*Math.sqrt(252) : null;
+      const sort  = (ddev>0 && mean_d!=null) ? (mean_d/ddev)*Math.sqrt(252) : null;
+
       const mar   = (mdd<0 && cagr!=null) ? (cagr/Math.abs(mdd)) : null;
       const win   = rets.length ? rets.filter(r=>r>0).length/rets.length : null;
 
       rows.push({
         Name: name,
         URL: base+sid,
-        CurrentValue: vals[vals.length-1],                 // <-- raw value (fixes the $239 vs $1,353 issue)
+        CurrentValue: vals[vals.length-1],                 // raw value
         Gain: gain,                                        // flow-neutral since-anchored cumulative return
-        QMGain: (name in qmGainByName) ? qmGainByName[name] : null, // site’s printed Gain if table exposes it
+        QMGain: (name in qmGainByName) ? qmGainByName[name] : null, // site's printed All Time / Gain if available
         Since: toDateISO(dts[0]),
         HasFlows: (Array.isArray(td.cash_flow_history) && td.cash_flow_history.length>0) ? 'Yes' : 'No',
         FlowCount: Array.isArray(td.cash_flow_history) ? td.cash_flow_history.length : 0,
