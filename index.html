@@ -28,75 +28,90 @@
   <div class="box">
     <div class="row">
       <label><b>Saved HTML:</b> <input type="file" id="htmlFile" accept=".html,.htm"></label>
-      <!-- Static label; actual download includes the date -->
+      <!-- Static label only; the real download name includes today’s date -->
       <button id="runBtn">Export → <code>QM_export.xlsx</code></button>
     </div>
     <div id="log" class="muted" style="margin-top:8px;"></div>
   </div>
 
 <script>
-/* ===== Config =====
-   Neutral table style; mint header; alternating white & light-mint row banding.
-*/
-const METRICS_TABLE_STYLE = 'TableStyleLight1'; // neutral; we style ourselves
-
-// Magic-mint family
+/* ===== Styling config ===== */
+const METRICS_TABLE_STYLE = 'TableStyleLight1'; // neutral; we style header/banding ourselves
 const MINT_HEADER = 'FFAAF0D1';  // header: Magic Mint (#AAF0D1)
-const MINT_BAND   = 'FFDFF7F3';  // a touch darker very-light mint for bands (#DFF7F3)
+const MINT_BAND   = 'FFDFF7F3';  // very light mint for alternating rows (#DFF7F3)
 const WHITE_FILL  = 'FFFFFFFF';
 
-/* ---------- helpers (robust date alignment) ---------- */
-// Robust YYYYMMDD → Date
+/* ===== Helper funcs ===== */
+const RE_CONST = name => new RegExp(`const\\s+${name}\\s*=\\s*(".*?");`, 's');
+function parseDoubleJSON(jsStringLiteral){ const inner = JSON.parse(jsStringLiteral); return JSON.parse(inner); }
+
 function ymdToDate(i){
-  const s = String(i).replace(/\D/g,'');        // tolerate strings
-  const p = s.padStart(8, '0');
-  const y = +p.slice(0,4), m = +p.slice(4,6)-1, d = +p.slice(6,8);
-  return new Date(y, m, d);
+  const s = String(i).replace(/\D/g,'');
+  const p = s.padStart(8,'0');
+  return new Date(+p.slice(0,4), +p.slice(4,6)-1, +p.slice(6,8));
 }
-
-// Prefer QuantMage-provided dates; otherwise synthesize by counting back from last_value_date
-function inferDates(vals, datesList, lastValueDate){
-  const n = vals.length;
-  if (Array.isArray(datesList) && datesList.length >= n){
-    return datesList.slice(-n).map(ymdToDate);
-  }
-  const end = (typeof lastValueDate === 'number') ? ymdToDate(lastValueDate) : new Date();
-  const out = [];
-  for (let i=0; i<n; i++){
-    const d = new Date(end);
-    d.setDate(d.getDate() - (n - 1 - i));
-    out.push(d);
-  }
-  return out;
-}
-
 function toDateISO(d){ const z=n=>String(n).padStart(2,'0'); return `${d.getFullYear()}-${z(d.getMonth()+1)}-${z(d.getDate())}`; }
 function todayStamp(){ const d=new Date(), z=n=>String(n).padStart(2,'0'); return `${d.getFullYear()}-${z(d.getMonth()+1)}-${z(d.getDate())}`; }
 
-// Stats helpers
-function stdev(arr){
-  if(arr.length<2) return 0;
-  const m = arr.reduce((a,b)=>a+b,0)/arr.length;
-  const v = arr.reduce((s,x)=>s+(x-m)*(x-m),0)/arr.length;
-  return Math.sqrt(v);
-}
-function maxDrawdown(values){
-  let peak = values[0], mdd = 0, dd = [];
-  for (const v of values){
-    peak = Math.max(peak, v);
-    const d = v/peak - 1;
-    mdd = Math.min(mdd, d);
-    dd.push(-d);
+/* Prefer QM dates[] when present; otherwise synthesize from last_value_date backwards */
+function inferDates(vals, datesList, lastValueDate){
+  const n=vals.length;
+  if (Array.isArray(datesList) && datesList.length>=n){
+    return datesList.slice(-n).map(ymdToDate);
   }
-  return { mdd, dd };
-}
-function ulcerIndex(dd){
-  if(!dd.length) return NaN;
-  const ms = dd.reduce((s,x)=>s+x*x,0)/dd.length;
-  return Math.sqrt(ms);
+  const end=(typeof lastValueDate==='number')? ymdToDate(lastValueDate) : new Date();
+  const out=[]; for(let i=0;i<n;i++){ const d=new Date(end); d.setDate(d.getDate()-(n-1-i)); out.push(d);} return out;
 }
 
-/* correlation with overlap, return null for non-finite */
+/* Stats */
+function stdev(arr){ if(arr.length<2) return 0; const m=arr.reduce((a,b)=>a+b,0)/arr.length; const v=arr.reduce((s,x)=>s+(x-m)*(x-m),0)/arr.length; return Math.sqrt(v); }
+function maxDrawdown(values){ let peak=values[0], mdd=0, dd=[]; for(const v of values){ peak=Math.max(peak,v); const d=v/peak-1; mdd=Math.min(mdd,d); dd.push(-d);} return {mdd, dd}; }
+function ulcerIndex(dd){ if(!dd.length) return NaN; const ms=dd.reduce((s,x)=>s+x*x,0)/dd.length; return Math.sqrt(ms); }
+
+/* ===== Anchor finder (prevents seed / rescaling jumps) =====
+   - Start at first >0 value
+   - Walk forward until the step return |r| <= 50% and prev>0
+   - Also sanity check vs the median of the next ~12 values (prev should not be a tiny seed)
+*/
+function findStableAnchor(vals, startIdx=0){
+  const n = vals.length;
+  let i = Math.max(0, startIdx);
+  // helper median
+  const median = a => {
+    if (!a.length) return NaN;
+    const s=[...a].sort((x,y)=>x-y);
+    const m=Math.floor(s.length/2);
+    return s.length%2?s[m]:(s[m-1]+s[m])/2;
+  };
+
+  // move to first strictly positive
+  while (i<n && !(vals[i]>0)) i++;
+  if (i>=n-1) return i;
+
+  while (i < n-1){
+    const a = vals[i], b = vals[i+1];
+    if (!(a>0 && b>0)){ i++; continue; }
+    const r = b/a - 1;
+    if (Math.abs(r) > 0.50){ i++; continue; }                 // skip absurd first step
+    const look = [];
+    for (let k=i; k<Math.min(n, i+14); k++){ if (vals[k]>0) look.push(vals[k]); }
+    const med = median(look);
+    if (isFinite(med) && a < 0.6*med){ i++; continue; }       // skip tiny seed vs neighborhood
+    break;
+  }
+  return i;
+}
+
+/* Correlation color: 0→white, +1→pale red, −1→pale blue */
+function corrToARGB(v){
+  if (v==null || !isFinite(v)) return null;
+  v = Math.max(-1, Math.min(1, v));
+  const lerp=(a,b,t)=>Math.round(a+(b-a)*t), hex=n=>n.toString(16).padStart(2,'0').toUpperCase();
+  if (v >= 0){ const t=v; return "FF"+hex(255)+hex(lerp(255,170,t))+hex(lerp(255,170,t)); }
+  const t=-v; return "FF"+hex(lerp(255,170,t))+hex(lerp(255,200,t))+hex(255);
+}
+
+/* Overlap correlation on date-keyed return maps */
 function corrForMaps(mapA, mapB){
   const aKeys = Object.keys(mapA), bKeys = Object.keys(mapB);
   const keys = aKeys.length < bKeys.length ? aKeys : bKeys;
@@ -107,19 +122,10 @@ function corrForMaps(mapA, mapB){
   let num=0, denx=0, deny=0;
   for(let i=0;i<xs.length;i++){ const dx=xs[i]-mx, dy=ys[i]-my; num+=dx*dy; denx+=dx*dx; deny+=dy*dy; }
   const den = Math.sqrt(denx*deny); if(den<=0) return null;
-  let r = num/den; if(!isFinite(r)) return null; if(r>1) r=1; if(r<-1) r=-1; return r;
+  let r = num/den; if(!isFinite(r)) return null; return Math.max(-1, Math.min(1, r));
 }
 
-/* color mapping for Correlations: 0→white, +1→pale red, −1→pale blue */
-function corrToARGB(v){
-  if (v==null || !isFinite(v)) return null;
-  const clamp = x => Math.max(-1, Math.min(1, x)); v = clamp(v);
-  const lerp = (a,b,t)=>Math.round(a+(b-a)*t); const hex = n => n.toString(16).padStart(2,'0').toUpperCase();
-  if (v >= 0){ const t=v; const r=255, g=lerp(255,170,t), b=lerp(255,170,t); return "FF"+hex(r)+hex(g)+hex(b); }
-  const t=-v; const r=lerp(255,170,t), g=lerp(255,200,t), b=255; return "FF"+hex(r)+hex(g)+hex(b);
-}
-
-/* ---------- main ---------- */
+/* ===== Main ===== */
 async function run(){
   try{
     const fileInput = document.getElementById('htmlFile');
@@ -129,10 +135,6 @@ async function run(){
 
     const html = await file.text();
 
-    // Pull const trading_spells / dates from the saved HTML (double-encoded JSON)
-    const RE_CONST = name => new RegExp(`const\\s+${name}\\s*=\\s*(".*?");`, 's');
-    function parseDoubleJSON(jsStringLiteral){ const inner = JSON.parse(jsStringLiteral); return JSON.parse(inner); }
-
     const mTS = RE_CONST('trading_spells').exec(html);
     if(!mTS){ alert('Could not find "const trading_spells" in the HTML'); return; }
     const trading_spells = parseDoubleJSON(mTS[1]);
@@ -141,104 +143,104 @@ async function run(){
     const dates_list = mDates ? parseDoubleJSON(mDates[1]) : null;
 
     const base = "https://quantmage.app/grimoire/";
-    const rowsRaw = [];
+    const rows = [];
     const names = [];
     const returnsMaps = {};
 
-    // -------- Parse each spell safely (aligned dates, first-positive start) --------
     for (const [sid, payload] of Object.entries(trading_spells)){
-      const td = payload.trading_data || {};
-      const rawVals = Array.isArray(td.value_history) ? td.value_history : [];
-      if (rawVals.length < 3) continue;
+      const name = (payload.name || "").trim();
+      const td   = payload.trading_data || {};
+      const vals = Array.isArray(td.value_history) ? td.value_history.map(Number) : [];
+      if (vals.length < 3) continue;
 
-      const vals = rawVals.map(Number);
+      // Align dates
       const dtsFull = inferDates(vals, dates_list, td.last_value_date);
 
-      // start at first strictly-positive value and keep dates aligned
-      let first = vals.findIndex(v => v > 0);
-      if (first === -1 || (vals.length - first) < 3) continue;
+      // Find a stable anchor (skips seed/warm-up)
+      const anchor = findStableAnchor(vals, 0);
+      if (anchor >= vals.length-2) continue;
 
-      const x   = vals.slice(first);
-      const dts = dtsFull.slice(first);
+      const x   = vals.slice(anchor);
+      const dts = dtsFull.slice(anchor);
 
-      // daily returns using aligned series (skip any step with non-positive)
+      // Daily arithmetic returns from stable region (guard against nonpositive)
       const rets = [];
       for (let i=1; i<x.length; i++){
         const a = x[i-1], b = x[i];
-        if (a > 0 && b > 0) rets.push(b/a - 1);
+        if (a>0 && b>0){
+          rets.push(b/a - 1);
+        }
       }
       if (rets.length < 2) continue;
 
-      // Metrics
-      const days   = Math.max((dts[dts.length-1] - dts[0]) / (1000*60*60*24), 1);
-      const years  = days / 365.25; // matches site better when dates are aligned
+      // Metrics (calendar-day span; annualize via √252)
+      const days   = Math.max((dts[dts.length-1] - dts[0])/(1000*60*60*24), 1);
+      const years  = days/365.25;
       const growth = x[x.length-1] / x[0];
-      const cagr   = years > 0 ? Math.pow(growth, 1/years) - 1 : NaN;
+      const cagr   = years>0 ? Math.pow(growth, 1/years) - 1 : NaN;
 
       const {mdd, dd} = maxDrawdown(x);
-      const ui   = ulcerIndex(dd);
-      const upi  = (ui>0) ? (cagr/ui) : NaN;
+      const ui    = ulcerIndex(dd);
+      const upi   = ui>0 ? (cagr/ui) : NaN;
 
-      const vol_d   = stdev(rets);
-      const vol_a   = vol_d * Math.sqrt(252);
-      const mean_d  = rets.reduce((a,b)=>a+b,0)/rets.length;
-      const sharpe  = vol_d>0 ? (mean_d/vol_d) * Math.sqrt(252) : NaN;
-      const downs   = rets.filter(r=>r<0);
-      const sortino = downs.length ? (mean_d / stdev(downs)) * Math.sqrt(252) : null;
+      const vol_d = stdev(rets);
+      const vol_a = vol_d * Math.sqrt(252);
+      const mean_d= rets.reduce((a,b)=>a+b,0)/rets.length;
+      const sharpe= vol_d>0 ? (mean_d/vol_d)*Math.sqrt(252) : NaN;
 
-      const winrate = rets.filter(r=>r>0).length / rets.length;
-      const gains   = rets.filter(r=>r>0).reduce((a,b)=>a+b,0);
-      const losses  = rets.filter(r=>r<0).reduce((a,b)=>a+b,0);
-      const gpr     = losses < 0 ? (gains/Math.abs(losses)) : null;
+      const neg   = rets.filter(r=>r<0);
+      const sort  = neg.length ? (mean_d / stdev(neg)) * Math.sqrt(252) : null;
 
-      const mar     = mdd < 0 ? (cagr/Math.abs(mdd)) : null;
-      const cumret  = growth - 1;
-      const since   = toDateISO(dts[0]);
+      const win   = rets.filter(r=>r>0).length / rets.length;
+      const gains = rets.filter(r=>r>0).reduce((a,b)=>a+b,0);
+      const loss  = rets.filter(r=>r<0).reduce((a,b)=>a+b,0);
+      const gpr   = loss < 0 ? (gains/Math.abs(loss)) : null;
+      const mar   = mdd < 0 ? (cagr/Math.abs(mdd)) : null;
 
-      const name = (payload.name || "").trim();
-      names.push(name);
-
-      rowsRaw.push({
+      rows.push({
         Name: name,
-        URL: base + sid,
+        URL: base+sid,
         CurrentValue: x[x.length-1],
-        Gain: cumret,                               // %
-        Since: since,
+        Gain: growth-1,                             // %
+        Since: toDateISO(dts[0]),
         CAGR: cagr,                                 // %
-        MD: (mdd==null? null : Math.abs(mdd)),      // %
+        MD: Math.abs(mdd),                          // %
         Sharpe: isFinite(sharpe)?sharpe:null,
-        Sortino: isFinite(sortino)?sortino:null,
+        Sortino: isFinite(sort)?sort:null,
         MAR: isFinite(mar)?mar:null,
         UPI: isFinite(upi)?upi:null,
         GPR: isFinite(gpr)?gpr:null,
-        WinRate: winrate,                           // %
+        WinRate: win,                               // %
         Volatility: vol_a,                          // %
-        CumulativeReturn: cumret                    // %
+        CumulativeReturn: growth-1                  // %
       });
 
-      // Returns map for correlations (aligned)
+      names.push(name);
+
+      // For correlations (overlapping dates)
       const m = {};
       for (let i=1; i<x.length; i++){
         const a = x[i-1], b = x[i];
-        if (a > 0 && b > 0){
-          m[toDateISO(dts[i])] = b/a - 1;
-        }
+        if (a>0 && b>0) m[toDateISO(dts[i])] = b/a - 1;
       }
       returnsMaps[name] = m;
     }
 
-    // keep non-empty columns (always keep Name & URL)
-    const allCols = Object.keys(rowsRaw[0] || {});
-    const headers = allCols.filter(c => {
+    if (!rows.length){ alert("No rows parsed. Double-check the HTML is a saved QuantMage page."); return; }
+
+    // Keep non-empty columns (always keep Name/URL)
+    const allCols = Object.keys(rows[0]);
+    const headers = allCols.filter(c=>{
       if (c==="Name"||c==="URL") return true;
-      return rowsRaw.some(r => r[c] !== "" && r[c] !== null && r[c] !== undefined && !(typeof r[c]==="number" && isNaN(r[c])));
+      return rows.some(r => r[c] !== "" && r[c] !== null && r[c] !== undefined && !(typeof r[c]==="number" && isNaN(r[c])));
     });
 
+    /* ===== Build workbook ===== */
     const wb = new ExcelJS.Workbook();
 
-    /* ---- Metrics: mint header + alternating white/mint bands ---- */
+    // ---- Metrics (mint header + alternating mint bands) ----
     const ws1 = wb.addWorksheet('Metrics', {views:[{state:'frozen', ySplit:1}]});
-    const metricsRows = rowsRaw.map(r => headers.map(h => r[h]));
+    const metricsRows = rows.map(r => headers.map(h => r[h]));
     ws1.addTable({
       name: 'MetricsTable',
       ref: 'A1',
@@ -248,14 +250,14 @@ async function run(){
       style: { theme: METRICS_TABLE_STYLE, showRowStripes: false, showColumnStripes: false }
     });
 
-    // Header styling (mint)
+    // Header style
     ws1.getRow(1).font = { bold: true };
     for (let c=1; c<=headers.length; c++){
       ws1.getCell(1,c).fill = { type:'pattern', pattern:'solid', fgColor:{argb: MINT_HEADER} };
     }
 
     // Column widths
-    headers.forEach((h, i) => {
+    headers.forEach((h,i)=>{
       const col = ws1.getColumn(i+1);
       if (h==='Name') col.width = 48;
       else if (h==='URL') col.width = 42;
@@ -264,73 +266,63 @@ async function run(){
     });
 
     // Number formats
-    const pctCols = ['Gain','CAGR','MD','WinRate','Volatility','CumulativeReturn'];
-    const twoDecCols = ['Sharpe','Sortino','MAR','UPI','GPR'];
-    const colIndex = Object.fromEntries(headers.map((h,i)=>[h,i+1]));
+    const pctCols   = ['Gain','CAGR','MD','WinRate','Volatility','CumulativeReturn'];
+    const twoDec    = ['Sharpe','Sortino','MAR','UPI','GPR'];
+    const colIndex  = Object.fromEntries(headers.map((h,i)=>[h,i+1]));
     for (let r=2; r<=metricsRows.length+1; r++){
       pctCols.forEach(h => { if(colIndex[h]) ws1.getCell(r, colIndex[h]).numFmt = '0.00%'; });
-      twoDecCols.forEach(h => { if(colIndex[h]) ws1.getCell(r, colIndex[h]).numFmt = '0.00'; });
+      twoDec.forEach(h => { if(colIndex[h]) ws1.getCell(r, colIndex[h]).numFmt = '0.00'; });
       if (colIndex['Since']) ws1.getCell(r, colIndex['Since']).numFmt = 'yyyy-mm-dd';
       if (colIndex['CurrentValue']) ws1.getCell(r, colIndex['CurrentValue']).numFmt = '$#,##0.00';
     }
 
-    // Alternating bands: white / very light mint
+    // Alternating bands
     for (let r=2; r<=metricsRows.length+1; r++){
-      const fill = (r % 2 === 0)
+      const fill = (r%2===0)
         ? { type:'pattern', pattern:'solid', fgColor:{argb: MINT_BAND} }
         : { type:'pattern', pattern:'solid', fgColor:{argb: WHITE_FILL} };
-      for (let c=1; c<=headers.length; c++){
-        ws1.getCell(r,c).fill = fill;
-      }
+      for (let c=1; c<=headers.length; c++) ws1.getCell(r,c).fill = fill;
     }
 
-    /* ---- Correlations (neutral labels, thin borders, heatmap only) ---- */
+    // ---- Correlations ----
     const ws2 = wb.addWorksheet('Correlations', {views:[{state:'frozen', xSplit:1, ySplit:1}]});
-    const header2 = ['Name', ...names];
-    ws2.addRow(header2);
-    const lightHeader = 'FFF2F2F2';
-    const labelA1     = 'FFF7F7F7';
-    const labelA2     = 'FFFBFBFB';
-    const borderClr   = 'FFE6E6E6';
+    const header2 = ['Name', ...names]; ws2.addRow(header2);
+    const lightHeader = 'FFF2F2F2', labelA1='FFF7F7F7', labelA2='FFFBFBFB', borderClr='FFE6E6E6';
 
     ws2.getRow(1).font = { bold: true };
     for (let c=1; c<=header2.length; c++){
-      ws2.getCell(1,c).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: lightHeader } };
+      ws2.getCell(1,c).fill = { type:'pattern', pattern:'solid', fgColor:{argb: lightHeader} };
     }
     for(let i=0;i<names.length;i++){
-      const row = [names[i]];
+      const row=[names[i]];
       for(let j=0;j<names.length;j++){
-        let v = (i===j) ? 1 : corrForMaps(returnsMaps[names[i]], returnsMaps[names[j]]);
-        row.push((v==null || !isFinite(v)) ? null : v);
+        const v = (i===j) ? 1 : corrForMaps(returnsMaps[names[i]], returnsMaps[names[j]]);
+        row.push((v==null||!isFinite(v))?null:v);
       }
       ws2.addRow(row);
     }
     ws2.getColumn(1).width = 48;
-    for(let c=2; c<=names.length+1; c++){ ws2.getColumn(c).width = 7; }
+    for(let c=2; c<=names.length+1; c++) ws2.getColumn(c).width = 7;
 
     for(let r=2; r<=names.length+1; r++){
-      const argb = (r % 2 === 0) ? labelA1 : labelA2;
+      const argb = (r%2===0) ? labelA1 : labelA2;
       ws2.getCell(r,1).fill = { type:'pattern', pattern:'solid', fgColor:{argb} };
     }
     for(let r=1; r<=names.length+1; r++){
       for(let c=1; c<=names.length+1; c++){
         const cell = ws2.getCell(r,c);
-        cell.border = {
-          top:    { style:'thin', color:{argb: borderClr} },
-          left:   { style:'thin', color:{argb: borderClr} },
-          bottom: { style:'thin', color:{argb: borderClr} },
-          right:  { style:'thin', color:{argb: borderClr} }
-        };
+        cell.border = { top:{style:'thin',color:{argb:borderClr}}, left:{style:'thin',color:{argb:borderClr}},
+                        bottom:{style:'thin',color:{argb:borderClr}}, right:{style:'thin',color:{argb:borderClr}} };
         if (r>=2 && c>=2){
           cell.numFmt = '0.00';
-          const val = (typeof cell.value === 'object' && cell.value && 'result' in cell.value) ? cell.value.result : cell.value;
-          const argb = corrToARGB(val);
-          if (argb){ cell.fill = { type:'pattern', pattern:'solid', fgColor:{argb} }; }
+          const v = (typeof cell.value==='object' && cell.value && 'result' in cell.value) ? cell.value.result : cell.value;
+          const argb = corrToARGB(v);
+          if (argb) cell.fill = { type:'pattern', pattern:'solid', fgColor:{argb} };
         }
       }
     }
 
-    // Download with date suffix
+    // ---- Download (date-stamped) ----
     const buf = await wb.xlsx.writeBuffer();
     const blob = new Blob([buf], {type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'});
     const a = document.createElement('a');
@@ -346,7 +338,7 @@ async function run(){
   }
 }
 
-// basic UI hooks
+// UI hooks
 const fileEl = document.getElementById('htmlFile');
 fileEl.addEventListener('change', () => { document.getElementById('log').textContent = fileEl.files.length ? fileEl.files[0].name : ""; });
 fileEl.addEventListener('input',  () => { document.getElementById('log').textContent = fileEl.files.length ? fileEl.files[0].name : ""; });
