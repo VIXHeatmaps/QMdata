@@ -24,7 +24,7 @@
   <p class="muted">
     Choose a saved QuantMage HTML ($ or % view). Outputs a formatted <b>.xlsx</b> with
     a <b>Metrics</b> sheet, a <b>Correlations</b> heatmap, a <b>Formulas</b> explainer,
-    and <b>Flows</b> history <em>*Exporter re-calculates all metrics and they can diverge from QuantMage.*</em> Everything runs locally.
+    and a new <b>Flows</b> sheet. *Exporter re-calculates all metrics and they can diverge from QuantMage.* Everything runs locally.
   </p>
   <div class="box">
     <div class="row">
@@ -175,70 +175,7 @@ function corrForMaps(mapA, mapB){
 function addFlowsSheet(wb, trading_spells, dates_list){
   const per = []; let maxFlows = 0;
   for (const [, payload] of Object.entries(trading_spells)){
-    const name = (payload.name || '').trim();
-    const td = payload.trading_data || {};
-    const vals = Array.isArray(td.value_history) ? td.value_history.map(Number) : [];
-    if (!name || !vals.length) continue;
-    const dts = inferDates(vals, dates_list, td.last_value_date);
-    if (!Array.isArray(dts) || dts.length !== vals.length) continue;
-
-    // Flow1 = initial funding (positive)
-    const pairs = [[ dts[0], vals[0] ]];
-    // Subsequent flows (investor-signed from reconstructFlows; flip sign for display)
-    const dollars = reconstructFlows(vals, dts, td.cash_flow_history, 0) || [];
-    for (const f of dollars){ pairs.push([ f.date, -f.cf ]); }
-
-    per.push({ name, pairs });
-    maxFlows = Math.max(maxFlows, pairs.length);
-  }
-
-  // Build rows data
-  const headers = ['Strategy', 'Net', 'Deposits', 'Withdrawals'];
-  for (let i=1; i<=maxFlows; i++) headers.push(`Date${i}`, `Flow${i}`);
-  const dataRows = [];
-  for (const {name, pairs} of per.sort((a,b)=>a.name.localeCompare(b.name))){
-    const amts = pairs.map(p=>p[1]).filter(x=>isFinite(x));
-    const net = roundTo100(amts.reduce((a,b)=>a+b,0));
-    const deps = roundTo100(amts.filter(a=>a>0).reduce((a,b)=>a+b,0));
-    const wdr = roundTo100(amts.filter(a=>a<0).reduce((a,b)=>a+b,0)); // negative total
-    const row = [ name, net, deps, wdr ];
-    for (const [d,a] of pairs){ row.push(toDateISO(d).replace(/-/g,'/'), roundTo100(a)); }
-    while (row.length < headers.length) row.push(null);
-    dataRows.push(row);
-  }
-
-  // Sheet with frozen header and table styling like Metrics
-  const ws = wb.addWorksheet('Flows', { views:[{ state:'frozen', xSplit:4, ySplit:1 }] });
-  ws.addTable({
-    name: 'FlowsTable',
-    ref: 'A1',
-    headerRow: true,
-    columns: headers.map(h => ({ name: h })),
-    rows: dataRows,
-    style: { theme: 'TableStyleLight1', showRowStripes: true, showColumnStripes: false }
-  });
-  // Gray header fill to match Metrics
-  ws.getRow(1).font = { bold: true };
-  for (let c=1; c<=headers.length; c++){
-    ws.getCell(1,c).fill = { type:'pattern', pattern:'solid', fgColor:{ argb: HEADER_GRAY } };
-  }
-  // Column widths
-  ws.getColumn(1).width = 60; // Strategy
-  ws.getColumn(2).width = 12; // Net
-  ws.getColumn(3).width = 14; // Deposits
-  ws.getColumn(4).width = 14; // Withdrawals
-  for (let c=5; c<=headers.length; c++){
-    ws.getColumn(c).width = (c % 2 === 1) ? 11 : 12; // Date / Flow
-  }
-  // Number formats
-  ws.getColumn(2).numFmt = '"$"#,##0';
-  ws.getColumn(3).numFmt = '"$"#,##0';
-  ws.getColumn(4).numFmt = '"$"#,##0';
-  for (let i=0;i<maxFlows;i++){
-    const flowCol = 5 + i*2 + 1; // Date column index (5) then Flow at +1
-    ws.getColumn(flowCol+1).numFmt = '"$"#,##0';
-  }
-}; const vals = Array.isArray(td.value_history) ? td.value_history.map(Number) : [];
+    const name = (payload.name || '').trim(); const td = payload.trading_data || {}; const vals = Array.isArray(td.value_history) ? td.value_history.map(Number) : [];
     if (!name || !vals.length) continue; const dts = inferDates(vals, dates_list, td.last_value_date); if (!Array.isArray(dts) || dts.length !== vals.length) continue;
     const pairs = [[ dts[0], vals[0] ]]; // Flow1 = initial funding (positive)
     const dollars = reconstructFlows(vals, dts, td.cash_flow_history, 0) || []; // investor-signed
@@ -337,6 +274,9 @@ async function run(){
         URL: base+sid,
         CurrentValue: endVal,
         Since: toDateISO(dts[0]),
+        HasFlows: (Array.isArray(td.cash_flow_history) && td.cash_flow_history.length>0) ? 'Yes' : 'No',
+        FlowCount: Array.isArray(td.cash_flow_history) ? td.cash_flow_history.length : 0,
+        LastFlow: (Array.isArray(td.cash_flow_history) && td.cash_flow_history.length>0) ? ymdIntToISO(td.cash_flow_history[td.cash_flow_history.length-1].date) : '' ,
         "Cumulative Return (TWR)": twr,
         "All Time (MWR)": (mwr!=null && isFinite(mwr)) ? mwr : null,
         CAGR: cagr,
@@ -362,7 +302,7 @@ async function run(){
 
     // Keep non-empty columns
     const allCols = Object.keys(rows[0]);
-    const must = new Set(['Name','URL','CurrentValue','Since','Cumulative Return (TWR)','All Time (MWR)']);
+    const must = new Set(['Name','URL','CurrentValue','Since','HasFlows','FlowCount','LastFlow','Cumulative Return (TWR)','All Time (MWR)']);
     const headers = allCols.filter(c=> must.has(c) || rows.some(r => r[c] !== '' && r[c] !== null && r[c] !== undefined && !(typeof r[c]==='number' && isNaN(r[c]))));
 
     /* ===== Build workbook ===== */
