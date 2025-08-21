@@ -68,7 +68,7 @@ function maxDrawdown(values){ let peak=values[0], mdd=0, dd=[]; for(const v of v
 function ulcerIndex(dd){ if(!dd.length) return NaN; const ms=dd.reduce((s,x)=>s+x*x,0)/dd.length; return Math.sqrt(ms); }
 
 /* =====================
-   Flows helpers (ADD)
+   Flows helpers
    ===================== */
 function roundTo100(n){
   if (n==null || !isFinite(n)) return null;
@@ -173,34 +173,85 @@ function corrForMaps(mapA, mapB){
    Build Flows sheet (wide)
    ===================== */
 function addFlowsSheet(wb, trading_spells, dates_list){
-  const per = []; let maxFlows = 0;
+  // Collect per-strategy pairs and find max flow count
+  const per = [];
+  let maxFlows = 0;
+
   for (const [, payload] of Object.entries(trading_spells)){
-    const name = (payload.name || '').trim(); const td = payload.trading_data || {}; const vals = Array.isArray(td.value_history) ? td.value_history.map(Number) : [];
-    if (!name || !vals.length) continue; const dts = inferDates(vals, dates_list, td.last_value_date); if (!Array.isArray(dts) || dts.length !== vals.length) continue;
-    const pairs = [[ dts[0], vals[0] ]]; // Flow1 = initial funding (positive)
-    const dollars = reconstructFlows(vals, dts, td.cash_flow_history, 0) || []; // investor-signed
-    for (const f of dollars){ pairs.push([ f.date, -f.cf ]); } // flip for display: deposits +, withdrawals -
-    per.push({ name, pairs }); maxFlows = Math.max(maxFlows, pairs.length);
+    const name = (payload.name || '').trim();
+    const td   = payload.trading_data || {};
+    const vals = Array.isArray(td.value_history) ? td.value_history.map(Number) : [];
+    if (!name || !vals.length) continue;
+
+    const dts = inferDates(vals, dates_list, td.last_value_date);
+    if (!Array.isArray(dts) || dts.length !== vals.length) continue;
+
+    // Flow1 = initial funding (positive)
+    const pairs = [[ dts[0], vals[0] ]];
+
+    // Subsequent flows from cash_flow_history:
+    // reconstructFlows() returns investor-signed (contrib negative, withdrawal positive),
+    // so flip sign for display (Deposits +, Withdrawals −).
+    const dollars = reconstructFlows(vals, dts, td.cash_flow_history, 0) || [];
+    for (const f of dollars){
+      pairs.push([ f.date, -f.cf ]);
+    }
+
+    per.push({ name, pairs });
+    if (pairs.length > maxFlows) maxFlows = pairs.length;
   }
-  const ws = wb.addWorksheet('Flows', { views:[{ state:'frozen', xSplit:4, ySplit:1 }] });
-  const headers = ['Strategy', 'Total (Net $)', 'Total Deposits ($)', 'Total Withdrawals ($)'];
+
+  // Build table data
+  const headers = ['Strategy', 'Net', 'Deposits', 'Withdrawals'];
   for (let i=1; i<=maxFlows; i++) headers.push(`Date${i}`, `Flow${i}`);
-  ws.addRow(headers); ws.getRow(1).font = { bold:true };
-  for (let c=1; c<=headers.length; c++){ ws.getCell(1,c).fill = { type:'pattern', pattern:'solid', fgColor:{ argb: HEADER_GRAY } }; }
+
+  const dataRows = [];
   for (const {name, pairs} of per.sort((a,b)=>a.name.localeCompare(b.name))){
-    const amts = pairs.map(p=>p[1]).filter(x=>isFinite(x));
-    const net = roundTo100(amts.reduce((a,b)=>a+b,0));
-    const deps = roundTo100(amts.filter(a=>a>0).reduce((a,b)=>a+b,0));
-    const wdr = roundTo100(Math.abs(amts.filter(a=>a<0).reduce((a,b)=>a+b,0)));
-    const row = [ name, net, deps, wdr ];
-    for (const [d,a] of pairs){ row.push(toDateISO(d).replace(/-/g,'/'), roundTo100(a)); }
+    const amts = pairs.map(p => p[1]).filter(x => isFinite(x));
+    const net  = roundTo100(amts.reduce((a,b)=>a+b, 0));
+    const deps = roundTo100(amts.filter(a=>a>0).reduce((a,b)=>a+b, 0));
+    const wdr  = roundTo100(Math.abs(amts.filter(a=>a<0).reduce((a,b)=>a+b, 0))); // positive total (matches prior working build)
+    const row  = [ name, net, deps, wdr ];
+    for (const [d,a] of pairs){
+      row.push(toDateISO(d).replace(/-/g,'/'), roundTo100(a));
+    }
     while (row.length < headers.length) row.push(null);
-    ws.addRow(row);
+    dataRows.push(row);
   }
-  ws.getColumn(1).width = 60; ws.getColumn(2).width = 14; ws.getColumn(3).width = 18; ws.getColumn(4).width = 18;
-  for (let c=5; c<=headers.length; c++){ ws.getColumn(c).width = (c % 2 === 1) ? 11 : 12; }
-  ws.getColumn(2).numFmt = '"$"#,##0'; ws.getColumn(3).numFmt = '"$"#,##0'; ws.getColumn(4).numFmt = '"$"#,##0';
-  for (let i=0;i<maxFlows;i++){ ws.getColumn(5 + i*2 + 2).numFmt = '"$"#,##0'; }
+
+  // Sheet + table (striped like Metrics) + header fill
+  const ws = wb.addWorksheet('Flows', { views:[{ state:'frozen', xSplit:4, ySplit:1 }] });
+  ws.addTable({
+    name: 'FlowsTable',
+    ref: 'A1',
+    headerRow: true,
+    columns: headers.map(h => ({ name: h })),
+    rows: dataRows,
+    style: { theme: 'TableStyleLight1', showRowStripes: true, showColumnStripes: false }
+  });
+
+  ws.getRow(1).font = { bold: true };
+  for (let c=1; c<=headers.length; c++){
+    ws.getCell(1,c).fill = { type:'pattern', pattern:'solid', fgColor:{ argb: HEADER_GRAY } };
+  }
+
+  // Column widths
+  ws.getColumn(1).width = 60; // Strategy
+  ws.getColumn(2).width = 12; // Net
+  ws.getColumn(3).width = 14; // Deposits
+  ws.getColumn(4).width = 14; // Withdrawals
+  for (let c=5; c<=headers.length; c++){
+    ws.getColumn(c).width = (c % 2 === 1) ? 11 : 12; // Date / Flow
+  }
+
+  // Currency format for totals and all Flow* columns
+  ws.getColumn(2).numFmt = '"$"#,##0';
+  ws.getColumn(3).numFmt = '"$"#,##0';
+  ws.getColumn(4).numFmt = '"$"#,##0';
+  for (let i=0; i<maxFlows; i++){
+    const flowCol = 5 + i*2 + 1; // Date col then Flow at +1
+    ws.getColumn(flowCol + 1).numFmt = '"$"#,##0';
+  }
 }
 
 /* =====================
@@ -300,10 +351,11 @@ async function run(){
     // Sort Metrics by Name A–Z
     rows.sort((a,b)=> (a.Name||'').localeCompare(b.Name||''));
 
-    // Keep non-empty columns
+    // Keep non-empty columns; DROP HasFlows / FlowCount / LastFlow from Metrics
     const allCols = Object.keys(rows[0]);
-    const must = new Set(['Name','URL','CurrentValue','Since','HasFlows','FlowCount','LastFlow','Cumulative Return (TWR)','All Time (MWR)']);
-    const headers = allCols.filter(c=> must.has(c) || rows.some(r => r[c] !== '' && r[c] !== null && r[c] !== undefined && !(typeof r[c]==='number' && isNaN(r[c]))));
+    const must = new Set(['Name','URL','CurrentValue','Since','Cumulative Return (TWR)','All Time (MWR)']);
+    const drop = new Set(['HasFlows','FlowCount','LastFlow']);
+    const headers = allCols.filter(c => !drop.has(c) && (must.has(c) || rows.some(r => r[c] !== '' && r[c] !== null && r[c] !== undefined && !(typeof r[c]==='number' && isNaN(r[c])))));
 
     /* ===== Build workbook ===== */
     const wb = new ExcelJS.Workbook();
